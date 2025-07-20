@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html>
 <head>
@@ -45,8 +44,9 @@
       surveyTeam: null,
       surveyTeamLabel: null,
       buildTeams: [], // Array of { sprite, targetX, targetY, targetPosX, targetPosY, blueprint, state, label }
-      logisticsTeams: [], // Array of { sprite, targetX, targetY, targetPosX, targetPosY, blueprint, state, label, materials, collectStartTime }
+      logisticsTeams: [], // Array of { sprite, targetX, targetY, targetPosX, targetPosY, blueprint, cache, state, label, materials, collectStartTime }
       blueprints: [], // Array of { x, y, structure, progress, loadingBar }
+      caches: [], // Array of { x, y, sprite, resources, inventoried }
       materials: {
         solarPrefabs: 20,
         powerLines: 15,
@@ -57,6 +57,7 @@
         concrete: 10,
         regolith: 0 // Mined as needed
       },
+      buggies: 2, // Start with 2 Mars buggies
       messages: [], // Array of { text, timestamp }
       menuVisible: false,
       menuOptions: ['Solar Array', 'Tunnel Entrance', 'Road', 'Dwelling', 'Wind Turbine', 'Landing Pad'],
@@ -84,7 +85,10 @@
       uiContainer: null,
       zoomLevel: 0,
       zoomScales: [1, 1.5, 2],
-      landingTile: { x: 9, y: 9 } // Landing Pad location (grid[9][9])
+      landingTile: { x: 9, y: 9 }, // Landing Pad location (grid[9][9])
+      lastWeatherToggle: 0,
+      lastDayUpdate: 0,
+      lastHourUpdate: 0
     };
 
     const config = {
@@ -103,6 +107,7 @@
       cameraSpeed: 300,
       buildTime: 30, // Seconds to build a structure
       regolithCollectTime: 5, // Seconds to collect 4 regolith
+      cacheSecureTime: 2400, // Seconds for survey team to secure cache (4 hours)
       messageDisplayTime: 10, // Seconds to display a message
       dayTime: 120, // Seconds per day
       hourTime: 10, // Seconds per 2-hour increment
@@ -181,12 +186,12 @@
     state.uiContainer.zIndex = 1000;
     app.stage.addChild(state.uiContainer);
 
-    state.statusText = new PIXI.Text('Day: 1 Hour: 10am\nPower: 0\nColonists: 25\nSurvey Teams: 1\nBuild Teams: 0\nLogistics Teams: 0\nOn Mission: 5\nWeather: Clear\nMaterials:\n  Solar Prefabs: 20\n  Power Lines: 15\n  Metal Struts: 10\n  Lighting: 10\n  Containers: 10\n  Tools: 10\n  Concrete: 10\n  Regolith: 0', { ...textStyle, align: 'left' });
+    state.statusText = new PIXI.Text('Day: 1 Hour: 10am\nPower: 0\nColonists: 25\nSurvey Teams: 1\nBuild Teams: 0\nLogistics Teams: 0\nOn Mission: 5\nWeather: Clear\nBuggies: 2', { ...textStyle, align: 'left' });
     state.statusText.x = 20;
     state.statusText.y = 20;
     state.uiContainer.addChild(state.statusText);
 
-    state.positionText = new PIXI.Text('Survey Team\n(0, 0)', { ...textStyle, align: 'right' });
+    state.positionText = new PIXI.Text('Survey Team: (0, 0)\nMaterials:\n  Solar Prefabs: 20\n  Power Lines: 15\n  Metal Struts: 10\n  Lighting: 10\n  Containers: 10\n  Tools: 10\n  Concrete: 10\n  Regolith: 0', { ...textStyle, align: 'right' });
     state.positionText.x = window.innerWidth - 20;
     state.positionText.y = 20;
     state.positionText.anchor.set(1, 0);
@@ -225,7 +230,9 @@
       const relativeY = y - 9;
       const terrain = x === 9 && y === 9 ? config.structures['Landing Pad'] : getRandomTerrain();
       const tile = new PIXI.Graphics();
-      tile.beginFill(terrain.color);
+      const structure = Object.values(config.structures).find(s => s.type === terrain.type);
+      const color = structure ? structure.color : terrain.color;
+      tile.beginFill(color);
       tile.lineStyle(2, 0x333333);
       tile.drawPolygon([
         0, config.tileHeight / 2,
@@ -238,28 +245,7 @@
       tile.x = posX + window.innerWidth / 2;
       tile.y = posY + window.innerHeight / 2;
       tile.interactive = true;
-      tile.on('mouseover', () => {
-        tile.clear();
-        tile.beginFill(terrain.color);
-        tile.lineStyle(2, 0x00FF00);
-        tile.drawPolygon([
-          0, config.tileHeight / 2,
-          config.tileWidth / 2, 0,
-          config.tileWidth, config.tileHeight / 2,
-          config.tileWidth / 2, config.tileHeight
-        ]);
-      });
-      tile.on('mouseout', () => {
-        tile.clear();
-        tile.beginFill(terrain.color);
-        tile.lineStyle(2, 0x333333);
-        tile.drawPolygon([
-          0, config.tileHeight / 2,
-          config.tileWidth / 2, 0,
-          config.tileWidth, config.tileHeight / 2,
-          config.tileWidth / 2, config.tileHeight
-        ]);
-      });
+      tile.buttonMode = true;
       tile.on('click', (event) => handleTileClick(event, relativeX, relativeY));
       tile.on('rightclick', (event) => openContextMenu(event, relativeX, relativeY));
 
@@ -267,10 +253,11 @@
       text.x = tile.x + config.tileWidth / 2;
       text.y = tile.y + config.tileHeight / 2;
       text.anchor.set(0.5);
+      text.zIndex = 10;
 
       app.stage.addChild(tile);
       app.stage.addChild(text);
-      return { sprite: tile, text: text, type: terrain.type, terrainType: terrain.type, relativeX, relativeY };
+      return { sprite: tile, text: text, type: terrain.type, terrainType: terrain.type, relativeX, relativeY, color };
     }
 
     // Weighted random terrain selection
@@ -284,12 +271,55 @@
       return config.terrainTypes[0];
     }
 
+    // Initialize grid
     for (let x = 0; x < config.gridSize; x++) {
       state.grid[x] = [];
       for (let y = 0; y < config.gridSize; y++) {
         state.grid[x][y] = createTile(x, y);
       }
     }
+
+    // Create 5 caches on random tiles (excluding Landing Pad at 9,9)
+    function createCaches() {
+      const cacheCount = 5;
+      const usedPositions = [{ x: 9, y: 9 }]; // Exclude Landing Pad
+      for (let i = 0; i < cacheCount; i++) {
+        let x, y;
+        do {
+          x = Math.floor(Math.random() * config.gridSize);
+          y = Math.floor(Math.random() * config.gridSize);
+        } while (usedPositions.some(pos => pos.x === x && pos.y === y));
+        usedPositions.push({ x, y });
+
+        const cache = new PIXI.Graphics();
+        cache.beginFill(0x8B4513); // Brown
+        cache.lineStyle(2, 0x000000);
+        cache.drawRect(-15, -7.5, 30, 15);
+        const posX = (x - 9) * config.tileWidth / 2 - (y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+        const posY = (x - 9 + y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+        cache.x = posX;
+        cache.y = posY;
+        cache.zIndex = 100;
+        app.stage.addChild(cache);
+
+        state.caches.push({
+          x, y,
+          sprite: cache,
+          resources: {
+            solarPrefabs: 5,
+            powerLines: 5,
+            metalStruts: 5,
+            lighting: 5,
+            containers: 5,
+            tools: 5,
+            concrete: 5
+          },
+          inventoried: false
+        });
+      }
+    }
+
+    createCaches();
 
     // Create Starship rectangle on Landing Pad
     state.starship = new PIXI.Graphics();
@@ -298,6 +328,7 @@
     state.starship.drawRect(-20, -10, 40, 20);
     state.starship.x = window.innerWidth / 2 + config.tileWidth / 2;
     state.starship.y = window.innerHeight / 2 + config.tileHeight / 2;
+    state.starship.zIndex = 50;
     app.stage.addChild(state.starship);
 
     // Adjust stage to center the grid
@@ -307,13 +338,16 @@
     app.stage.scale.y = 1;
     app.stage.sortableChildren = true;
 
-    // Add survey team starting at (0,0) (grid[9][9])
+    // Add survey team starting at Starship (0,0) (grid[9][9])
     state.surveyTeam = new PIXI.Graphics();
-    state.surveyTeam.beginFill(0xFF0000); // Red fill
+    state.surveyTeam.beginFill(0xFF0000); // Red
     state.surveyTeam.lineStyle(2, 0x000000);
     state.surveyTeam.drawCircle(0, 0, 15);
-    state.surveyTeam.x = window.innerWidth / 2 + config.tileWidth / 2;
-    state.surveyTeam.y = window.innerHeight / 2 + config.tileHeight / 2;
+    state.surveyTeam.x = state.starship.x; // Spawn at Starship
+    state.surveyTeam.y = state.starship.y;
+    state.surveyTeam.state = 'idle';
+    state.surveyTeam.startTime = 0;
+    state.surveyTeam.zIndex = 200;
     app.stage.addChild(state.surveyTeam);
 
     // Add survey team label
@@ -321,6 +355,7 @@
     state.surveyTeamLabel.x = state.surveyTeam.x;
     state.surveyTeamLabel.y = state.surveyTeam.y + 20;
     state.surveyTeamLabel.anchor.set(0.5);
+    state.surveyTeamLabel.zIndex = 210;
     app.stage.addChild(state.surveyTeamLabel);
 
     // Find closest desert tile for Regolith collection
@@ -338,6 +373,22 @@
           }
         }
       }
+      return closest;
+    }
+
+    // Find closest uninventoried cache
+    function findClosestCache(x, y) {
+      let closest = null;
+      let minDistance = Infinity;
+      state.caches.forEach(cache => {
+        if (!cache.inventoried) {
+          const dist = Math.abs(cache.x - x) + Math.abs(cache.y - y);
+          if (dist < minDistance) {
+            minDistance = dist;
+            closest = cache;
+          }
+        }
+      });
       return closest;
     }
 
@@ -377,6 +428,10 @@
           const terrain = config.terrainTypes.find(t => t.type === tile.terrainType);
           description = terrain ? terrain.description : 'Unknown terrain';
         }
+        const cache = state.caches.find(c => c.x === tile.relativeX + 9 && c.y === tile.relativeY + 9);
+        if (cache) {
+          description += `\nSupply Cache: ${cache.inventoried ? 'Inventoried' : 'Uninventoried'}. Contains 5 Solar Prefabs, 5 Power Lines, 5 Metal Struts, 5 Lighting, 5 Containers, 5 Tools, 5 Concrete.`;
+        }
       }
       // Measure text height
       const metrics = PIXI.TextMetrics.measureText(description, new PIXI.TextStyle(analysisTextStyle));
@@ -406,10 +461,10 @@
 
     // Update UI function
     function updateUI() {
-      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 5; // Survey team (5) + build teams (5 each) + logistics teams (5 each)
-      state.statusText.text = `Day: ${state.day} Hour: ${formatHour(state.hour)}\nPower: ${state.power}\nColonists: ${state.population}\nSurvey Teams: 1\nBuild Teams: ${state.buildTeams.length}\nLogistics Teams: ${state.logisticsTeams.length}\nOn Mission: ${onMission}\nWeather: ${state.dustStorm ? 'Dust Storm' : 'Clear'}\nMaterials:\n  Solar Prefabs: ${state.materials.solarPrefabs}\n  Power Lines: ${state.materials.powerLines}\n  Metal Struts: ${state.materials.metalStruts}\n  Lighting: ${state.materials.lighting}\n  Containers: ${state.materials.containers}\n  Tools: ${state.materials.tools}\n  Concrete: ${state.materials.concrete}\n  Regolith: ${state.materials.regolith}`;
+      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 2; // Survey team (5) + build teams (5 each) + logistics teams (2 each)
+      state.statusText.text = `Day: ${state.day} Hour: ${formatHour(state.hour)}\nPower: ${state.power}\nColonists: ${state.population}\nSurvey Teams: 1\nBuild Teams: ${state.buildTeams.length}\nLogistics Teams: ${state.logisticsTeams.length}\nOn Mission: ${onMission}\nWeather: ${state.dustStorm ? 'Dust Storm' : 'Clear'}\nBuggies: ${state.buggies}`;
       const { x: gridX, y: gridY } = getGridPosition(state.surveyTeam.x, state.surveyTeam.y);
-      state.positionText.text = `Survey Team\n(${gridX - 9}, ${gridY - 9})`;
+      state.positionText.text = `Survey Team: (${gridX - 9}, ${gridY - 9})\nMaterials:\n  Solar Prefabs: ${state.materials.solarPrefabs}\n  Power Lines: ${state.materials.powerLines}\n  Metal Struts: ${state.materials.metalStruts}\n  Lighting: ${state.materials.lighting}\n  Containers: ${state.materials.containers}\n  Tools: ${state.materials.tools}\n  Concrete: ${state.materials.concrete}\n  Regolith: ${state.materials.regolith}`;
       state.positionText.x = window.innerWidth - 20;
     }
 
@@ -417,8 +472,8 @@
     function updateMessageLog() {
       const currentTime = app.ticker.lastTime / 1000;
       if (isHovering) {
-        // Show all messages, newest on top, with scrolling
-        const visibleMessages = state.messages.slice().reverse().slice(state.messageLogScroll, state.messageLogScroll + 5); // Show up to 5 messages
+        // Show up to 5 messages, newest first
+        const visibleMessages = state.messages.slice().reverse().slice(state.messageLogScroll, state.messageLogScroll + 5);
         state.messageLogText.text = visibleMessages.map(m => m.text).join('\n');
       } else {
         // Show only the most recent message if not expired
@@ -437,14 +492,33 @@
       updateMessageLog();
     }
 
-    // Spawn logistics team from Landing Pad
-    function spawnLogisticsTeam(blueprint) {
+    // Spawn logistics team from Starship
+    function spawnLogisticsTeam(blueprint, buildTeam) {
+      if (state.buggies < 1) {
+        addMessage('No Mars buggies available for logistics team');
+        app.stage.removeChild(buildTeam.sprite);
+        app.stage.removeChild(buildTeam.label);
+        buildTeam.sprite.destroy();
+        buildTeam.label.destroy();
+        return null;
+      }
+      if (state.population - (5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 2) < 2) {
+        addMessage('Not enough colonists for logistics team');
+        app.stage.removeChild(buildTeam.sprite);
+        app.stage.removeChild(buildTeam.label);
+        buildTeam.sprite.destroy();
+        buildTeam.label.destroy();
+        return null;
+      }
+      state.buggies -= 1;
+
       const team = new PIXI.Graphics();
-      team.beginFill(0x00FF00); // Green fill
+      team.beginFill(0x00FF00); // Green
       team.lineStyle(2, 0x000000);
       team.drawCircle(0, 0, 15);
-      team.x = (state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
-      team.y = (state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      team.x = state.starship.x; // Spawn at Starship
+      team.y = state.starship.y;
+      team.zIndex = 200;
       app.stage.addChild(team);
 
       // Add logistics team label
@@ -452,7 +526,14 @@
       team.label.x = team.x;
       team.label.y = team.y + 20;
       team.label.anchor.set(0.5);
+      team.label.zIndex = 210;
       app.stage.addChild(team.label);
+
+      // Move build team with logistics team
+      buildTeam.sprite.x = team.x;
+      buildTeam.sprite.y = team.y;
+      buildTeam.label.x = buildTeam.sprite.x;
+      buildTeam.label.y = buildTeam.sprite.y + 20;
 
       // Find closest desert tile for Regolith
       const desertTile = findClosestDesertTile(blueprint.x, blueprint.y);
@@ -460,35 +541,45 @@
         addMessage('No desert tile found for Regolith collection');
         app.stage.removeChild(team);
         app.stage.removeChild(team.label);
+        app.stage.removeChild(buildTeam.sprite);
+        app.stage.removeChild(buildTeam.label);
         team.destroy();
         team.label.destroy();
-        return;
+        buildTeam.sprite.destroy();
+        buildTeam.label.destroy();
+        state.buggies += 1;
+        return null;
       }
 
       const targetPosX = (desertTile.x - 9) * config.tileWidth / 2 - (desertTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
       const targetPosY = (desertTile.x - 9 + desertTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
-      state.logisticsTeams.push({ 
+      const logisticsTeam = { 
         sprite: team, 
         targetX: desertTile.x - 9, 
         targetY: desertTile.y - 9, 
         targetPosX, 
         targetPosY, 
         blueprint, 
+        buildTeam, 
         state: 'movingToDesert', 
         label: team.label, 
-        materials: { regolith: 0 } 
-      });
-      addMessage(`Logistics team spawned for ${blueprint.structure} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+        materials: { regolith: 0 },
+        collectStartTime: 0
+      };
+      state.logisticsTeams.push(logisticsTeam);
+      addMessage(`Logistics team (2 colonists) spawnedagliari from Starship for ${blueprint.structure} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+      return logisticsTeam;
     }
 
-    // Spawn build team from Landing Pad
+    // Spawn build team from Starship
     function spawnBuildTeam(blueprint) {
       const team = new PIXI.Graphics();
-      team.beginFill(0x0000FF); // Blue fill
+      team.beginFill(0x0000FF); // Blue
       team.lineStyle(2, 0x000000);
       team.drawCircle(0, 0, 15);
-      team.x = (state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
-      team.y = (state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      team.x = state.starship.x; // Spawn at Starship
+      team.y = state.starship.y;
+      team.zIndex = 200;
       app.stage.addChild(team);
 
       // Add build team label
@@ -496,12 +587,14 @@
       team.label.x = team.x;
       team.label.y = team.y + 20;
       team.label.anchor.set(0.5);
+      team.label.zIndex = 210;
       app.stage.addChild(team.label);
 
       const targetPosX = (blueprint.x - 9) * config.tileWidth / 2 - (blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
       const targetPosY = (blueprint.x - 9 + blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
-      state.buildTeams.push({ sprite: team, targetX: blueprint.x - 9, targetY: blueprint.y - 9, targetPosX, targetPosY, blueprint, state: 'movingTo', label: team.label });
-      addMessage(`Build team spawned for ${blueprint.structure} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+      const buildTeam = { sprite: team, targetX: blueprint.x - 9, targetY: blueprint.y - 9, targetPosX, targetPosY, blueprint, state: 'transported', label: team.label, startTime: 0 };
+      state.buildTeams.push(buildTeam);
+      return buildTeam;
     }
 
     // Check if materials are available
@@ -527,9 +620,13 @@
 
     // Place blueprint on tile
     function placeBlueprint(option, relativeX, relativeY) {
-      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 5; // Survey team + build teams + logistics teams
-      if (state.population - onMission < 10) { // 5 for build team, 5 for logistics team
-        addMessage(`Not enough colonists available to spawn teams (Need 10, Available: ${state.population - onMission})`);
+      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 2;
+      if (state.population - onMission < 7) { // 5 for build team, 2 for logistics team
+        addMessage(`Not enough colonists available to spawn teams (Need 7, Available: ${state.population - onMission})`);
+        return;
+      }
+      if (state.buggies < 1) {
+        addMessage('No Mars buggies available for logistics team');
         return;
       }
 
@@ -559,6 +656,7 @@
       }
 
       tile.type = 'blueprint';
+      tile.color = 0x0000FF;
       tile.sprite.clear();
       tile.sprite.beginFill(0x0000FF, 0.5); // Blue, semi-transparent
       tile.sprite.lineStyle(2, 0x333333);
@@ -568,7 +666,7 @@
         config.tileWidth, config.tileHeight / 2,
         config.tileWidth / 2, config.tileHeight
       ]);
-      tile.text.text = `${structure.text}\nBlueprint`; // Structure name on first line, Blueprint on second
+      tile.text.text = `${structure.text}\nBlueprint`;
 
       // Create loading bar
       const loadingBar = new PIXI.Graphics();
@@ -576,13 +674,20 @@
       loadingBar.y = tile.y + config.tileHeight / 2 + 10;
       loadingBar.beginFill(0xFFFFFF);
       loadingBar.drawRect(0, 0, 0, 5); // Empty bar
+      loadingBar.zIndex = 100;
       app.stage.addChild(loadingBar);
 
       state.blueprints.push({ x: gridX, y: gridY, structure: option, progress: 0, loadingBar });
       deductMaterials(option);
-      spawnBuildTeam({ x: gridX, y: gridY, structure: option });
-      spawnLogisticsTeam({ x: gridX, y: gridY, structure: option });
-      addMessage(`Placed ${structure.text} blueprint at (${relativeX}, ${relativeY})`);
+      const buildTeam = spawnBuildTeam({ x: gridX, y: gridY, structure: option });
+      if (buildTeam) {
+        const logisticsTeam = spawnLogisticsTeam({ x: gridX, y: gridY, structure: option }, buildTeam);
+        if (!logisticsTeam) {
+          state.buildTeams = state.buildTeams.filter(t => t !== buildTeam);
+        } else {
+          addMessage(`Placed ${structure.text} blueprint at (${relativeX}, ${relativeY})`);
+        }
+      }
     }
 
     // Complete blueprint construction
@@ -590,6 +695,7 @@
       const structure = config.structures[blueprint.structure];
       const tile = state.grid[blueprint.x][blueprint.y];
       tile.type = structure.type;
+      tile.color = structure.color;
       tile.sprite.clear();
       tile.sprite.beginFill(structure.color);
       tile.sprite.lineStyle(2, 0x333333);
@@ -599,7 +705,7 @@
         config.tileWidth, config.tileHeight / 2,
         config.tileWidth / 2, config.tileHeight
       ]);
-      tile.text.text = `${structure.text}\n${tile.terrainType}`; // Structure name and terrain type
+      tile.text.text = `${structure.text}\n${tile.terrainType}`;
 
       updatePower();
       if (structure.maxPopulation) {
@@ -612,7 +718,6 @@
       addMessage(`Completed ${blueprint.structure} on ${tile.terrainType} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
       app.stage.removeChild(blueprint.loadingBar);
       blueprint.loadingBar.destroy();
-      // Defer blueprint removal to game loop
     }
 
     // Place building at survey team's position
@@ -621,14 +726,29 @@
       placeBlueprint(option, gridX - 9, gridY - 9);
     }
 
-    // Handle tile left click for survey team movement
+    // Handle tile left click for survey team movement or cache securing
     function handleTileClick(event, x, y) {
       if (state.contextMenu) {
         closeContextMenu();
       }
 
-      state.targetX = x;
-      state.targetY = y;
+      const cache = state.caches.find(c => c.x === x + 9 && c.y === y + 9 && !c.inventoried);
+      if (cache) {
+        state.surveyTeam.state = 'movingToCache';
+        state.surveyTeam.targetCache = cache;
+        state.surveyTeam.targetX = x;
+        state.surveyTeam.targetY = y;
+        state.surveyTeam.targetPosX = (x * config.tileWidth / 2 - y * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+        state.surveyTeam.targetPosY = ((x + y) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        state.surveyTeam.startTime = app.ticker.lastTime / 1000;
+        addMessage(`Survey team moving to cache at (${x}, ${y})`);
+      } else {
+        state.surveyTeam.state = 'moving';
+        state.surveyTeam.targetX = x;
+        state.surveyTeam.targetY = y;
+        state.surveyTeam.targetPosX = (x * config.tileWidth / 2 - y * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+        state.surveyTeam.targetPosY = ((x + y) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+      }
 
       if (state.path) {
         app.stage.removeChild(state.path);
@@ -636,14 +756,59 @@
         state.path = null;
       }
 
-      state.targetPosX = (x * config.tileWidth / 2 - y * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-      state.targetPosY = ((x + y) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-
       state.path = new PIXI.Graphics();
       state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
       state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
-      state.path.lineTo(state.targetPosX, state.targetPosY);
+      state.path.lineTo(state.surveyTeam.targetPosX, state.surveyTeam.targetPosY);
+      state.path.zIndex = 150;
       app.stage.addChild(state.path);
+    }
+
+    // Send logistics team to collect cache resources
+    function sendLogisticsTeamToCache(cache) {
+      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 2;
+      if (state.population - onMission < 2) {
+        addMessage(`Not enough colonists available to spawn logistics team (Need 2, Available: ${state.population - onMission})`);
+        return;
+      }
+      if (state.buggies < 1) {
+        addMessage('No Mars buggies available for logistics team');
+        return;
+      }
+      state.buggies -= 1;
+
+      const team = new PIXI.Graphics();
+      team.beginFill(0x00FF00); // Green
+      team.lineStyle(2, 0x000000);
+      team.drawCircle(0, 0, 15);
+      team.x = state.starship.x; // Spawn at Starship
+      team.y = state.starship.y;
+      team.zIndex = 200;
+      app.stage.addChild(team);
+
+      // Add logistics team label
+      team.label = new PIXI.Text('Logistics Team', { ...teamLabelStyle });
+      team.label.x = team.x;
+      team.label.y = team.y + 20;
+      team.label.anchor.set(0.5);
+      team.label.zIndex = 210;
+      app.stage.addChild(team.label);
+
+      const targetPosX = (cache.x - 9) * config.tileWidth / 2 - (cache.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+      const targetPosY = (cache.x - 9 + cache.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      state.logisticsTeams.push({
+        sprite: team,
+        targetX: cache.x - 9,
+        targetY: cache.y - 9,
+        targetPosX,
+        targetPosY,
+        cache,
+        state: 'movingToCache',
+        label: team.label,
+        materials: { regolith: 0 },
+        collectStartTime: 0
+      });
+      addMessage(`Logistics team dispatched from Starship to collect cache at (${cache.x - 9}, ${cache.y - 9})`);
     }
 
     // WASD camera controls and bottom menu trigger
@@ -689,10 +854,40 @@
           state.path.clear();
           state.path.lineStyle(2 / newScale, 0xFFFFFF, 1);
           state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
-          state.path.lineTo(state.targetPosX, state.targetPosY);
+          state.path.lineTo(state.surveyTeam.targetPosX, state.surveyTeam.targetPosY);
         }
 
         state.uiContainer.scale.set(1 / newScale);
+        // Update menu positions to account for new stage position
+        if (state.contextMenu) {
+          state.contextMenu.x = Math.max(0, Math.min(state.contextMenu.x, window.innerWidth - 100));
+          state.contextMenu.y = Math.max(0, Math.min(state.contextMenu.y, window.innerHeight - contextMenuHeight));
+          state.contextMenuItems.forEach((item, index) => {
+            item.x = state.contextMenu.x + 10;
+            item.y = state.contextMenu.y + 10 + index * 20;
+          });
+        }
+        if (state.buildMenu) {
+          state.buildMenu.x = Math.max(0, Math.min(state.buildMenu.x, window.innerWidth - 200));
+          state.buildMenu.y = Math.max(0, Math.min(state.buildMenu.y, window.innerHeight - buildMenuHeight));
+          state.bottomMenuItems.forEach((item, index) => {
+            item.x = state.buildMenu.x + 10;
+            item.y = state.buildMenu.y + 10 + index * 20;
+          });
+        }
+        if (state.bottomMenu) {
+          state.bottomMenu.y = window.innerHeight - 100;
+          state.bottomMenuItems.forEach((item, index) => {
+            item.x = 20 + index * 120;
+            item.y = state.bottomMenu.y + 20;
+          });
+        }
+        if (state.analysisWindow) {
+          state.analysisWindow.x = Math.max(0, Math.min(state.analysisWindow.x, window.innerWidth - 220));
+          state.analysisWindow.y = Math.max(0, Math.min(state.analysisWindow.y, window.innerHeight - state.analysisWindow.height));
+          state.analysisText.x = state.analysisWindow.x + 10;
+          state.analysisText.y = state.analysisWindow.y + 10;
+        }
       }
     });
 
@@ -719,22 +914,20 @@
       state.menuVisible = true;
       state.contextMenu = new PIXI.Graphics();
       state.contextMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
-      state.contextMenu.drawRect(0, 0, 100, contextMenuHeight); // Dynamic height (~80px)
+      state.contextMenu.drawRect(0, 0, 100, contextMenuHeight);
       const tile = state.grid[relativeX + 9][relativeY + 9];
-      // Convert tile world coordinates to screen coordinates
-      const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
-      const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
-      // Ensure menu stays within screen bounds
-      state.contextMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 100));
-      state.contextMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - contextMenuHeight));
+      // Adjust menu position for camera offset
+      const menuX = (tile.sprite.x + config.tileWidth / 2 + 10) / app.stage.scale.x - app.stage.x / app.stage.scale.x;
+      const menuY = (tile.sprite.y - 20) / app.stage.scale.y - app.stage.y / app.stage.scale.y;
+      state.contextMenu.x = Math.max(0, Math.min(menuX, window.innerWidth / app.stage.scale.x - 100));
+      state.contextMenu.y = Math.max(0, Math.min(menuY, window.innerHeight / app.stage.scale.y - contextMenuHeight));
       state.contextMenu.zIndex = 900;
       state.uiContainer.addChild(state.contextMenu);
 
-      const contextOptions = ['Build', 'Analyse', 'Close'];
       state.contextMenuItems = contextOptions.map((option, index) => {
         const itemText = new PIXI.Text(option, { ...menuTextStyle });
         itemText.x = state.contextMenu.x + 10;
-        itemText.y = state.contextMenu.y + 10 + index * 20; // Fixed 20px spacing
+        itemText.y = state.contextMenu.y + 10 + index * 20;
         itemText.anchor.set(0, 0);
         itemText.interactive = true;
         itemText.buttonMode = true;
@@ -743,17 +936,18 @@
           e.stopPropagation();
           if (option === 'Build') {
             closeContextMenu();
-            openBuildMenu((tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x, (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y, relativeX, relativeY);
+            openBuildMenu((tile.sprite.x + config.tileWidth / 2 + 10) / app.stage.scale.x - app.stage.x / app.stage.scale.x, (tile.sprite.y - 20) / app.stage.scale.y - app.stage.y / app.stage.scale.y, relativeX, relativeY);
           } else if (option === 'Analyse') {
             closeContextMenu();
             const { description, height } = getTileDescription(tile);
             state.analysisWindow = new PIXI.Graphics();
-            state.analysisWindow.beginFill(0x333333, 1.0); // Dark grey, opaque
-            state.analysisWindow.drawRect(0, 0, 220, height); // Dynamic height
-            const analysisX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
-            const analysisY = (tile.sprite.y + config.tileHeight / 2 + 20 - app.stage.y) / app.stage.scale.y;
-            state.analysisWindow.x = Math.max(0, Math.min(analysisX, window.innerWidth - 220));
-            state.analysisWindow.y = Math.max(0, Math.min(analysisY, window.innerHeight - height));
+            state.analysisWindow.beginFill(0x333333, 1.0);
+            state.analysisWindow.drawRect(0, 0, 220, height);
+            const analysisX = (tile.sprite.x + config.tileWidth / 2 + 10) / app.stage.scale.x - app.stage.x / app.stage.scale.x;
+            const analysisY = (tile.sprite.y + config.tileHeight / 2 + 20) / app.stage.scale.y - app.stage.y / app.stage.scale.y;
+            state.analysisWindow.x = Math.max(0, Math.min(analysisX, window.innerWidth / app.stage.scale.x - 220));
+            state.analysisWindow.y = Math.max(0, Math.min(analysisY, window.innerHeight / app.stage.scale.y - height));
+            state.analysisWindow.height = height; // Store height for bounds checking
             state.analysisWindow.zIndex = 900;
             state.uiContainer.addChild(state.analysisWindow);
 
@@ -770,7 +964,7 @@
         return itemText;
       });
 
-      app.stage.off('click', handleOutsideClick); // Remove any existing to avoid duplicates
+      app.stage.off('click', handleOutsideClick);
       app.stage.on('click', handleOutsideClick);
     }
 
@@ -811,18 +1005,17 @@
       closeAnalysisWindow();
       state.menuVisible = true;
       state.buildMenu = new PIXI.Graphics();
-      state.buildMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
-      state.buildMenu.drawRect(0, 0, 200, buildMenuHeight); // Dynamic height (~140px)
-      // Ensure menu stays within screen bounds
-      state.buildMenu.x = Math.max(0, Math.min(x, window.innerWidth - 200));
-      state.buildMenu.y = Math.max(0, Math.min(y, window.innerHeight - buildMenuHeight));
+      state.buildMenu.beginFill(0x333333, 1.0);
+      state.buildMenu.drawRect(0, 0, 200, buildMenuHeight);
+      state.buildMenu.x = Math.max(0, Math.min(x, window.innerWidth / app.stage.scale.x - 200));
+      state.buildMenu.y = Math.max(0, Math.min(y, window.innerHeight / app.stage.scale.y - buildMenuHeight));
       state.buildMenu.zIndex = 900;
       state.uiContainer.addChild(state.buildMenu);
 
-      state.menuItems = state.menuOptions.map((option, index) => {
+      state.bottomMenuItems = state.menuOptions.map((option, index) => {
         const itemText = new PIXI.Text(option, { ...menuTextStyle });
         itemText.x = state.buildMenu.x + 10;
-        itemText.y = state.buildMenu.y + 10 + index * 20; // Fixed 20px spacing
+        itemText.y = state.buildMenu.y + 10 + index * 20;
         itemText.anchor.set(0, 0);
         itemText.interactive = true;
         itemText.buttonMode = true;
@@ -835,423 +1028,311 @@
         state.uiContainer.addChild(itemText);
         return itemText;
       });
-
-      app.stage.off('click', handleOutsideClick); // Remove any existing to avoid duplicates
-      app.stage.on('click', handleOutsideClick);
     }
 
     // Close build menu
     function closeBuildMenu() {
-      if (state.menuVisible && state.buildMenu) {
+      if (state.buildMenu) {
         state.menuVisible = false;
-        state.menuItems.forEach(item => {
+        state.bottomMenuItems.forEach(item => {
           state.uiContainer.removeChild(item);
           item.destroy();
         });
         state.uiContainer.removeChild(state.buildMenu);
         state.buildMenu.destroy();
         state.buildMenu = null;
-        state.menuItems = [];
-        closeAnalysisWindow();
-        app.stage.off('click', handleOutsideClick);
+        state.bottomMenuItems = [];
       }
     }
 
-    // Open bottom build menu
+    // Open bottom menu
     function openBottomMenu() {
-      if (!state.bottomMenu && !state.menuVisible) {
-        state.bottomMenu = new PIXI.Graphics();
-        state.bottomMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
-        const menuHeight = 100;
-        state.bottomMenu.drawRect(0, 0, window.innerWidth, menuHeight);
-        state.bottomMenu.y = window.innerHeight;
-        state.bottomMenu.zIndex = 900;
-        state.uiContainer.addChild(state.bottomMenu);
+      closeContextMenu();
+      closeBuildMenu();
+      closeAnalysisWindow();
 
-        state.bottomMenuItems = state.menuOptions.map((option, index) => {
-          const itemText = new PIXI.Text(option, { ...textStyle, fontSize: 16 });
-          itemText.x = (index * (window.innerWidth / state.menuOptions.length)) + (window.innerWidth / (2 * state.menuOptions.length)) - (itemText.width / 2);
-          itemText.y = 10;
-          itemText.anchor.set(0.5, 0);
-          itemText.interactive = true;
-          itemText.buttonMode = true;
-          itemText.zIndex = 900;
-          itemText.on('click', (e) => {
-            e.stopPropagation();
-            placeBuilding(option);
-            closeBottomMenu();
-          });
-          state.bottomMenu.addChild(itemText);
-          return itemText;
+      state.menuVisible = true;
+      state.bottomMenu = new PIXI.Graphics();
+      state.bottomMenu.beginFill(0x333333, 1.0);
+      state.bottomMenu.drawRect(0, window.innerHeight / app.stage.scale.y - 100, window.innerWidth / app.stage.scale.x, 100);
+      state.bottomMenu.zIndex = 900;
+      state.uiContainer.addChild(state.bottomMenu);
+
+      state.bottomMenuItems = state.menuOptions.map((option, index) => {
+        const itemText = new PIXI.Text(option, { ...menuTextStyle });
+        itemText.x = 20 + index * 120;
+        itemText.y = state.bottomMenu.y + 20;
+        itemText.anchor.set(0, 0);
+        itemText.interactive = true;
+        itemText.buttonMode = true;
+        itemText.zIndex = 900;
+        itemText.on('click', (e) => {
+          e.stopPropagation();
+          placeBuilding(option);
+          closeBottomMenu();
         });
-
-        state.menuTargetY = window.innerHeight - menuHeight;
-        state.menuVisible = true;
-        addMessage('Bottom menu opened');
-      }
+        state.uiContainer.addChild(itemText);
+        return itemText;
+      });
     }
 
-    // Close bottom build menu
+    // Close bottom menu
     function closeBottomMenu() {
       if (state.bottomMenu) {
-        state.menuTargetY = window.innerHeight;
         state.menuVisible = false;
-        setTimeout(() => {
-          state.bottomMenuItems.forEach(item => {
-            item.destroy();
-            state.bottomMenu.removeChild(item);
-          });
-          state.uiContainer.removeChild(state.bottomMenu);
-          state.bottomMenu.destroy();
-          state.bottomMenu = null;
-          state.bottomMenuItems = [];
-        }, 500);
-      }
-    }
-
-    // Handle window resize
-    function handleResize() {
-      app.renderer.resize(window.innerWidth, window.innerHeight);
-      state.menuY = window.innerHeight;
-      state.menuTargetY = state.bottomMenu ? window.innerHeight - 100 : window.innerHeight;
-      if (state.bottomMenu) {
-        state.bottomMenu.y = state.menuY;
-        state.bottomMenu.clear();
-        state.bottomMenu.beginFill(0x333333, 1.0);
-        state.bottomMenu.drawRect(0, 0, window.innerWidth, 100);
-        state.bottomMenuItems.forEach((item, index) => {
-          item.x = (index * (window.innerWidth / state.menuOptions.length)) + (window.innerWidth / (2 * state.menuOptions.length)) - (item.width / 2);
+        state.bottomMenuItems.forEach(item => {
+          state.uiContainer.removeChild(item);
+          item.destroy();
         });
+        state.uiContainer.removeChild(state.bottomMenu);
+        state.bottomMenu.destroy();
+        state.bottomMenu = null;
+        state.bottomMenuItems = [];
       }
-      state.grid.forEach(row => row.forEach(tile => {
-        const posX = tile.relativeX * config.tileWidth / 2 - tile.relativeY * config.tileWidth / 2;
-        const posY = (tile.relativeX + tile.relativeY) * config.tileHeight / 2;
-        tile.sprite.x = posX + window.innerWidth / 2;
-        tile.sprite.y = posY + window.innerHeight / 2;
-        tile.text.x = tile.sprite.x + config.tileWidth / 2;
-        tile.text.y = tile.sprite.y + config.tileHeight / 2;
-      }));
-      if (state.starship) {
-        state.starship.x = window.innerWidth / 2 + config.tileWidth / 2;
-        state.starship.y = window.innerHeight / 2 + config.tileHeight / 2;
-      }
-      state.buildTeams.forEach(team => {
-        if (team.state === 'movingTo') {
-          team.targetPosX = (team.targetX * config.tileWidth / 2 - team.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-          team.targetPosY = ((team.targetX + team.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        } else if (team.state === 'returning') {
-          team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-          team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        }
-        if (team.label) {
-          team.label.x = team.sprite.x;
-          team.label.y = team.sprite.y + 20;
-        }
-      });
-      state.logisticsTeams.forEach(team => {
-        if (team.state === 'movingToDesert') {
-          team.targetPosX = (team.targetX * config.tileWidth / 2 - team.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-          team.targetPosY = ((team.targetX + team.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        } else if (team.state === 'movingToBlueprint') {
-          team.targetPosX = (team.blueprint.x - 9) * config.tileWidth / 2 - (team.blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
-          team.targetPosY = ((team.blueprint.x - 9 + team.blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        } else if (team.state === 'returning') {
-          team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-          team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        }
-        if (team.label) {
-          team.label.x = team.sprite.x;
-          team.label.y = team.sprite.y + 20;
-        }
-      });
-      state.blueprints.forEach(blueprint => {
-        blueprint.loadingBar.x = (blueprint.x - 9) * config.tileWidth / 2 - (blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2;
-        blueprint.loadingBar.y = ((blueprint.x - 9 + blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2) + 10;
-      });
-      if (state.targetPosX !== null && state.targetPosY !== null) {
-        state.targetPosX = (state.targetX * config.tileWidth / 2 - state.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-        state.targetPosY = ((state.targetX + state.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-        if (state.path) {
-          state.path.clear();
-          state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
-          state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
-          state.path.lineTo(state.targetPosX, state.targetPosY);
-        }
-      }
-      state.positionText.x = window.innerWidth - 20;
-      state.messageLogText.y = window.innerHeight - 20;
-      if (state.surveyTeamLabel) {
-        state.surveyTeamLabel.x = state.surveyTeam.x;
-        state.surveyTeamLabel.y = state.surveyTeam.y + 20;
-      }
-      if (state.contextMenu) {
-        const tile = state.grid[Math.round((state.contextMenu.x * app.stage.scale.x + app.stage.x - config.tileWidth / 2 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.contextMenu.y * app.stage.scale.y + app.stage.y + 20 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
-        if (tile) {
-          const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
-          const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
-          state.contextMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 100));
-          state.contextMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - contextMenuHeight));
-          state.contextMenuItems.forEach((item, index) => {
-            item.x = state.contextMenu.x + 10;
-            item.y = state.contextMenu.y + 10 + index * 20;
-          });
-        }
-      }
-      if (state.buildMenu) {
-        const tile = state.grid[Math.round((state.buildMenu.x * app.stage.scale.x + app.stage.x - config.tileWidth / 2 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.buildMenu.y * app.stage.scale.y + app.stage.y + 20 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
-        if (tile) {
-          const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
-          const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
-          state.buildMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 200));
-          state.buildMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - buildMenuHeight));
-          state.menuItems.forEach((item, index) => {
-            item.x = state.buildMenu.x + 10;
-            item.y = state.buildMenu.y + 10 + index * 20;
-          });
-        }
-      }
-      if (state.analysisWindow) {
-        const tile = state.grid[Math.round((state.analysisWindow.x * app.stage.scale.x + app.stage.x + 110 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.analysisWindow.y * app.stage.scale.y + app.stage.y - 20 - config.tileHeight / 2 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
-        if (tile) {
-          const { height } = getTileDescription(tile);
-          const analysisX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
-          const analysisY = (tile.sprite.y + config.tileHeight / 2 + 20 - app.stage.y) / app.stage.scale.y;
-          state.analysisWindow.x = Math.max(0, Math.min(analysisX, window.innerWidth - 220));
-          state.analysisWindow.y = Math.max(0, Math.min(analysisY, window.innerHeight - height));
-          state.analysisText.x = state.analysisWindow.x + 10;
-          state.analysisText.y = state.analysisWindow.y + 10;
-        }
-      }
-      state.uiContainer.scale.set(1 / app.stage.scale.x);
-      updateUI();
-      updateMessageLog();
     }
 
-    window.addEventListener('resize', handleResize);
-
-    // Game loop for survey team, build teams, logistics teams, blueprints, camera, and timers
-    let lastDayUpdate = 0;
-    let lastHourUpdate = 0;
-    let lastDustStormUpdate = 0;
+    // Game loop for time, weather, and team movements
     app.ticker.add((delta) => {
-      // Survey team movement
-      if (state.targetPosX !== null && state.targetPosY !== null) {
-        const dx = state.targetPosX - state.surveyTeam.x;
-        const dy = state.targetPosY - state.surveyTeam.y;
+      const currentTime = app.ticker.lastTime / 1000;
+
+      // Update time
+      if (currentTime - state.lastHourUpdate >= config.hourTime) {
+        state.hour = (state.hour + 2) % 24;
+        state.lastHourUpdate = currentTime;
+        if (state.hour === 0) {
+          state.day += 1;
+          state.lastDayUpdate = currentTime;
+        }
+        updateUI();
+      }
+
+      // Update weather
+      if (currentTime - state.lastWeatherToggle >= 30) {
+        state.dustStorm = !state.dustStorm;
+        state.lastWeatherToggle = currentTime;
+        addMessage(`Weather changed to ${state.dustStorm ? 'Dust Storm' : 'Clear'}`);
+        updatePower();
+        updateUI();
+      }
+
+      // Update survey team
+      if (state.surveyTeam.state === 'moving' || state.surveyTeam.state === 'movingToCache') {
+        const terrain = getTerrainType(state.surveyTeam.x, state.surveyTeam.y);
+        const speed = config.moveSpeed * config.terrainSpeedModifiers[terrain] * delta / 60;
+        const dx = state.surveyTeam.targetPosX - state.surveyTeam.x;
+        const dy = state.surveyTeam.targetPosY - state.surveyTeam.y;
         const distance = Math.sqrt(dx * dx + dy * dy);
-
-        if (distance > 5) {
-          const terrainType = getTerrainType(state.surveyTeam.x, state.surveyTeam.y);
-          const speedModifier = config.terrainSpeedModifiers[terrainType] || 1.0;
-          const speed = config.moveSpeed * speedModifier * (delta / 60) * app.stage.scale.x;
-          const moveDistance = Math.min(speed, distance);
-          const moveX = (dx / distance) * moveDistance;
-          const moveY = (dy / distance) * moveDistance;
-
-          state.surveyTeam.x += moveX;
-          state.surveyTeam.y += moveY;
+        if (distance > speed) {
+          const angle = Math.atan2(dy, dx);
+          state.surveyTeam.x += Math.cos(angle) * speed;
+          state.surveyTeam.y += Math.sin(angle) * speed;
           state.surveyTeamLabel.x = state.surveyTeam.x;
           state.surveyTeamLabel.y = state.surveyTeam.y + 20;
-
-          if (state.path) {
-            state.path.clear();
-            state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
-            state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
-            state.path.lineTo(state.targetPosX, state.targetPosY);
-          }
-
-          updateUI();
         } else {
-          state.surveyTeam.x = state.targetPosX;
-          state.surveyTeam.y = state.targetPosY;
+          state.surveyTeam.x = state.surveyTeam.targetPosX;
+          state.surveyTeam.y = state.surveyTeam.targetPosY;
           state.surveyTeamLabel.x = state.surveyTeam.x;
           state.surveyTeamLabel.y = state.surveyTeam.y + 20;
-          state.targetPosX = null;
-          state.targetPosY = null;
-          if (state.path) {
-            app.stage.removeChild(state.path);
-            state.path.destroy();
-            state.path = null;
+          if (state.surveyTeam.state === 'movingToCache') {
+            state.surveyTeam.state = 'securingCache';
+            state.surveyTeam.startTime = currentTime;
+            addMessage(`Survey team securing cache at (${state.surveyTeam.targetX}, ${state.surveyTeam.targetY})`);
+          } else {
+            state.surveyTeam.state = 'idle';
+            if (state.path) {
+              app.stage.removeChild(state.path);
+              state.path.destroy();
+              state.path = null;
+            }
           }
+        }
+        updateUI();
+      } else if (state.surveyTeam.state === 'securingCache') {
+        if (currentTime - state.surveyTeam.startTime >= config.cacheSecureTime) {
+          const cache = state.surveyTeam.targetCache;
+          cache.inventoried = true;
+          for (let material in cache.resources) {
+            state.materials[material] = (state.materials[material] || 0) + cache.resources[material];
+          }
+          addMessage(`Cache at (${cache.x - 9}, ${cache.y - 9}) inventoried. Resources added.`);
+          sendLogisticsTeamToCache(cache);
+          state.surveyTeam.state = 'idle';
+          state.surveyTeam.targetCache = null;
           updateUI();
         }
       }
 
-      // Build team movement and construction
-      const completedBlueprints = [];
-      const completedBuildTeams = [];
-      state.buildTeams.forEach(team => {
-        if (team.state === 'movingTo' || team.state === 'returning') {
+      // Update logistics teams
+      state.logisticsTeams.forEach((team, index) => {
+        const terrain = getTerrainType(team.sprite.x, team.sprite.y);
+        const speed = (terrain === 'flats' || terrain === 'desert' ? config.logisticsSpeed : config.moveSpeed * config.terrainSpeedModifiers[terrain]) * delta / 60;
+        if (team.state === 'movingToDesert') {
           const dx = team.targetPosX - team.sprite.x;
           const dy = team.targetPosY - team.sprite.y;
           const distance = Math.sqrt(dx * dx + dy * dy);
-
-          if (distance > 5) {
-            const terrainType = getTerrainType(team.sprite.x, team.sprite.y);
-            const speedModifier = config.terrainSpeedModifiers[terrainType] || 1.0;
-            const speed = config.moveSpeed * speedModifier * (delta / 60) * app.stage.scale.x;
-            const moveDistance = Math.min(speed, distance);
-            const moveX = (dx / distance) * moveDistance;
-            const moveY = (dy / distance) * moveDistance;
-
-            team.sprite.x += moveX;
-            team.sprite.y += moveY;
+          if (distance > speed) {
+            const angle = Math.atan2(dy, dx);
+            team.sprite.x += Math.cos(angle) * speed;
+            team.sprite.y += Math.sin(angle) * speed;
             team.label.x = team.sprite.x;
             team.label.y = team.sprite.y + 20;
+            team.buildTeam.sprite.x = team.sprite.x;
+            team.buildTeam.sprite.y = team.sprite.y;
+            team.buildTeam.label.x = team.buildTeam.sprite.x;
+            team.buildTeam.label.y = team.buildTeam.sprite.y + 20;
           } else {
             team.sprite.x = team.targetPosX;
             team.sprite.y = team.targetPosY;
             team.label.x = team.sprite.x;
             team.label.y = team.sprite.y + 20;
-            if (team.state === 'movingTo') {
-              team.state = 'building';
-              team.buildStartTime = app.ticker.lastTime / 1000; // Start construction timer
-              addMessage(`Build team reached blueprint at (${team.targetX}, ${team.targetY}), starting construction`);
-            } else if (team.state === 'returning') {
-              app.stage.removeChild(team.sprite);
-              app.stage.removeChild(team.label);
-              team.sprite.destroy();
-              team.label.destroy();
-              completedBuildTeams.push(team);
-              if (state.population < state.maxPopulation) {
-                state.population += 5; // Return 5 colonists to pool
-              }
-              addMessage(`Build team returned to Landing Pad and despawned`);
-            }
-          }
-        } else if (team.state === 'building' && team.blueprint && team.blueprint.loadingBar) {
-          const elapsed = app.ticker.lastTime / 1000 - team.buildStartTime;
-          team.blueprint.progress = elapsed / config.buildTime;
-          team.blueprint.loadingBar.clear();
-          team.blueprint.loadingBar.beginFill(0xFFFFFF);
-          team.blueprint.loadingBar.drawRect(0, 0, config.tileWidth * team.blueprint.progress, 5);
-
-          if (elapsed >= config.buildTime) {
-            completeBuild(team.blueprint);
-            completedBlueprints.push(team.blueprint);
-            team.state = 'returning';
-            team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-            team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-            addMessage(`Build team completed construction at (${team.targetX}, ${team.targetY}), returning to Landing Pad`);
-          }
-        }
-      });
-
-      // Logistics team movement and material collection
-      const completedLogisticsTeams = [];
-      state.logisticsTeams.forEach(team => {
-        if (team.state === 'movingToDesert' || team.state === 'movingToBlueprint' || team.state === 'returning') {
-          const dx = team.targetPosX - team.sprite.x;
-          const dy = team.targetPosY - team.sprite.y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-
-          if (distance > 5) {
-            const terrainType = getTerrainType(team.sprite.x, team.sprite.y);
-            const isFastTerrain = terrainType === 'flats' || terrainType === 'desert';
-            const speed = (isFastTerrain ? config.logisticsSpeed : config.moveSpeed) * (config.terrainSpeedModifiers[terrainType] || 1.0) * (delta / 60) * app.stage.scale.x;
-            const moveDistance = Math.min(speed, distance);
-            const moveX = (dx / distance) * moveDistance;
-            const moveY = (dy / distance) * moveDistance;
-
-            team.sprite.x += moveX;
-            team.sprite.y += moveY;
-            team.label.x = team.sprite.x;
-            team.label.y = team.sprite.y + 20;
-          } else {
-            team.sprite.x = team.targetPosX;
-            team.sprite.y = team.targetPosY;
-            team.label.x = team.sprite.x;
-            team.label.y = team.sprite.y + 20;
-            if (team.state === 'movingToDesert') {
-              team.state = 'collectingRegolith';
-              team.collectStartTime = app.ticker.lastTime / 1000;
-              addMessage(`Logistics team reached desert at (${team.targetX}, ${team.targetY}), collecting Regolith`);
-            } else if (team.state === 'movingToBlueprint') {
-              team.state = 'delivering';
-              const materialsNeeded = config.structures[team.blueprint.structure].materials.regolith || 0;
-              state.materials.regolith += Math.min(team.materials.regolith, materialsNeeded);
-              team.materials.regolith = 0;
-              addMessage(`Logistics team delivered ${Math.min(team.materials.regolith, materialsNeeded)} Regolith to ${team.blueprint.structure} at (${team.blueprint.x - 9}, ${team.blueprint.y - 9})`);
-              team.state = 'returning';
-              team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
-              team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
-            } else if (team.state === 'returning') {
-              app.stage.removeChild(team.sprite);
-              app.stage.removeChild(team.label);
-              team.sprite.destroy();
-              team.label.destroy();
-              completedLogisticsTeams.push(team);
-              if (state.population < state.maxPopulation) {
-                state.population += 5; // Return 5 colonists to pool
-              }
-              addMessage(`Logistics team returned to Landing Pad and despawned`);
-            }
+            team.buildTeam.sprite.x = team.sprite.x;
+            team.buildTeam.sprite.y = team.sprite.y;
+            team.buildTeam.label.x = team.buildTeam.sprite.x;
+            team.buildTeam.label.y = team.buildTeam.sprite.y + 20;
+            team.state = 'collectingRegolith';
+            team.collectStartTime = currentTime;
+            addMessage(`Logistics team collecting Regolith at (${team.targetX}, ${team.targetY})`);
           }
         } else if (team.state === 'collectingRegolith') {
-          const elapsed = app.ticker.lastTime / 1000 - team.collectStartTime;
-          if (elapsed >= config.regolithCollectTime) {
-            team.materials.regolith = 4; // Collect 4 Regolith
+          if (currentTime - team.collectStartTime >= config.regolithCollectTime) {
+            team.materials.regolith = 4;
+            state.materials.regolith += 4;
             team.state = 'movingToBlueprint';
             team.targetPosX = (team.blueprint.x - 9) * config.tileWidth / 2 - (team.blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
             team.targetPosY = (team.blueprint.x - 9 + team.blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
-            addMessage(`Logistics team collected 4 Regolith, moving to blueprint at (${team.blueprint.x - 9}, ${team.blueprint.y - 9})`);
+            team.targetX = team.blueprint.x - 9;
+            team.targetY = team.blueprint.y - 9;
+            addMessage(`Logistics team collected 4 Regolith, moving to blueprint at (${team.targetX}, ${team.targetY})`);
+          }
+        } else if (team.state === 'movingToBlueprint') {
+          const dx = team.targetPosX - team.sprite.x;
+          const dy = team.targetPosY - team.sprite.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          if (distance > speed) {
+            const angle = Math.atan2(dy, dx);
+            team.sprite.x += Math.cos(angle) * speed;
+            team.sprite.y += Math.sin(angle) * speed;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            team.buildTeam.sprite.x = team.sprite.x;
+            team.buildTeam.sprite.y = team.sprite.y;
+            team.buildTeam.label.x = team.buildTeam.sprite.x;
+            team.buildTeam.label.y = team.buildTeam.sprite.y + 20;
+          } else {
+            team.sprite.x = team.targetPosX;
+            team.sprite.y = team.targetPosY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            team.buildTeam.sprite.x = team.sprite.x;
+            team.buildTeam.sprite.y = team.sprite.y;
+            team.buildTeam.label.x = team.buildTeam.sprite.x;
+            team.buildTeam.label.y = team.buildTeam.sprite.y + 20;
+            team.buildTeam.state = 'building';
+            team.buildTeam.startTime = currentTime;
+            team.state = 'returning';
+            team.targetPosX = state.starship.x; // Return to Starship
+            team.targetPosY = state.starship.y;
+            team.targetX = state.landingTile.x - 9;
+            team.targetY = state.landingTile.y - 9;
+            addMessage(`Logistics team delivered build team and materials to blueprint at (${team.blueprint.x - 9}, ${team.blueprint.y - 9}), returning to Starship`);
+          }
+        } else if (team.state === 'returning') {
+          const dx = team.targetPosX - team.sprite.x;
+          const dy = team.targetPosY - team.sprite.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          if (distance > speed) {
+            const angle = Math.atan2(dy, dx);
+            team.sprite.x += Math.cos(angle) * speed;
+            team.sprite.y += Math.sin(angle) * speed;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+          } else {
+            team.sprite.x = team.targetPosX;
+            team.sprite.y = team.targetPosY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            app.stage.removeChild(team.sprite);
+            app.stage.removeChild(team.label);
+            team.sprite.destroy();
+            team.label.destroy();
+            state.buggies += 1;
+            state.logisticsTeams.splice(index, 1);
+            addMessage(`Logistics team returned to Starship`);
+          }
+        } else if (team.state === 'movingToCache') {
+          const dx = team.targetPosX - team.sprite.x;
+          const dy = team.targetPosY - team.sprite.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          if (distance > speed) {
+            const angle = Math.atan2(dy, dx);
+            team.sprite.x += Math.cos(angle) * speed;
+            team.sprite.y += Math.sin(angle) * speed;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+          } else {
+            team.sprite.x = team.targetPosX;
+            team.sprite.y = team.targetPosY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            team.state = 'collectingCache';
+            team.collectStartTime = currentTime;
+            addMessage(`Logistics team collecting cache resources at (${team.targetX}, ${team.targetY})`);
+          }
+        } else if (team.state === 'collectingCache') {
+          if (currentTime - team.collectStartTime >= config.regolithCollectTime) {
+            for (let material in team.cache.resources) {
+              state.materials[material] = (state.materials[material] || 0) + team.cache.resources[material];
+            }
+            team.state = 'returning';
+            team.targetPosX = state.starship.x; // Return to Starship
+            team.targetPosY = state.starship.y;
+            team.targetX = state.landingTile.x - 9;
+            team.targetY = state.landingTile.y - 9;
+            addMessage(`Logistics team collected cache resources at (${team.cache.x - 9}, ${team.cache.y - 9}), returning to Starship`);
           }
         }
       });
 
-      // Remove completed blueprints and teams after iteration
-      state.blueprints = state.blueprints.filter(b => !completedBlueprints.includes(b));
-      state.buildTeams = state.buildTeams.filter(t => !completedBuildTeams.includes(t));
-      state.logisticsTeams = state.logisticsTeams.filter(t => !completedLogisticsTeams.includes(t));
-
-      // Remove expired messages
-      const currentTime = app.ticker.lastTime / 1000;
-      state.messages = state.messages.filter(m => currentTime - m.timestamp < config.messageDisplayTime || isHovering);
-      updateMessageLog();
-
-      const cameraSpeed = config.cameraSpeed * (delta / 60) * app.stage.scale.x;
-      if (state.keys.w) app.stage.y += cameraSpeed;
-      if (state.keys.s) app.stage.y -= cameraSpeed;
-      if (state.keys.a) app.stage.x += cameraSpeed;
-      if (state.keys.d) app.stage.x -= cameraSpeed;
-
-      if (state.bottomMenu && state.menuY !== state.menuTargetY) {
-        if (Math.abs(state.menuY - state.menuTargetY) < state.menuSpeed) {
-          state.menuY = state.menuTargetY;
-        } else {
-          state.menuY += (state.menuTargetY - state.menuY) > 0 ? state.menuSpeed : -state.menuSpeed;
+      // Update build teams
+      state.buildTeams.forEach((team, index) => {
+        if (team.state === 'building') {
+          const blueprint = state.blueprints.find(b => b.x === team.targetX + 9 && b.y === team.targetY + 9);
+          if (blueprint) {
+            const progress = (currentTime - team.startTime) / config.buildTime;
+            blueprint.progress = Math.min(progress, 1);
+            blueprint.loadingBar.clear();
+            blueprint.loadingBar.beginFill(0xFFFFFF);
+            blueprint.loadingBar.drawRect(0, 0, config.tileWidth * blueprint.progress, 5);
+            if (progress >= 1) {
+              completeBuild(blueprint);
+              state.blueprints = state.blueprints.filter(b => b !== blueprint);
+              app.stage.removeChild(team.sprite);
+              app.stage.removeChild(team.label);
+              team.sprite.destroy();
+              team.label.destroy();
+              state.buildTeams.splice(index, 1);
+              addMessage(`Build team completed ${blueprint.structure} at (${team.targetX}, ${team.targetY})`);
+            }
+          }
         }
-        state.bottomMenu.y = state.menuY;
-      }
+      });
 
-      state.uiContainer.x = -app.stage.x / app.stage.scale.x;
-      state.uiContainer.y = -app.stage.y / app.stage.scale.y;
-      state.uiContainer.scale.set(1 / app.stage.scale.x);
+      // Update camera
+      if (state.keys.w) app.stage.y += config.cameraSpeed * delta / 60;
+      if (state.keys.s) app.stage.y -= config.cameraSpeed * delta / 60;
+      if (state.keys.a) app.stage.x += config.cameraSpeed * delta / 60;
+      if (state.keys.d) app.stage.x -= config.cameraSpeed * delta / 60;
 
-      // Update day, hour, and dust storm timers
-      lastDayUpdate += delta / 60;
-      lastHourUpdate += delta / 60;
-      lastDustStormUpdate += delta / 60;
-      if (lastHourUpdate >= config.hourTime) {
-        state.hour = (state.hour + 2) % 24;
-        lastHourUpdate = 0;
+      // Update bottom menu position
+      if (state.bottomMenu) {
+        state.bottomMenu.y = window.innerHeight / app.stage.scale.y - 100;
+        state.bottomMenuItems.forEach((item, index) => {
+          item.x = 20 + index * 120;
+          item.y = state.bottomMenu.y + 20;
+        });
       }
-      if (lastDayUpdate >= config.dayTime) {
-        state.day += 1;
-        lastDayUpdate = 0;
-      }
-      if (lastDustStormUpdate >= 30) {
-        state.dustStorm = !state.dustStorm;
-        updatePower();
-        lastDustStormUpdate = 0;
-      }
-
-      updateUI();
     });
 
-    // Initialize UI
-    updateUI();
   </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'961485e529e67717',t:'MTc1Mjg2ODM4My4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9624a48f1c75129d',t:'MTc1MzAzNzQxMS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
