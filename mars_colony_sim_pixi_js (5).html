@@ -1,0 +1,1257 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Mars Colony Sim with PixiJS</title>
+  <script src="https://pixijs.download/v7.3.2/pixi.min.js"></script>
+  <link rel="preload" as="font" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400&display=swap" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400&display=swap" rel="stylesheet">
+  <style>
+    body { margin: 0; }
+    #game-container { display: flex; flex-direction: column; align-items: center; width: 100vw; height: 100vh; }
+    #game { width: 100vw; height: 100vh; position: relative; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <div id="game"></div>
+  </div>
+  <script>
+    // Initialize PixiJS Application with dynamic window size
+    const app = new PIXI.Application({ 
+      width: window.innerWidth, 
+      height: window.innerHeight, 
+      backgroundColor: 0xB5651D, 
+      antialias: true,
+      resizeTo: window
+    });
+    document.getElementById('game').appendChild(app.view);
+
+    // Prevent browser context menu on right-click
+    app.view.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+    });
+
+    // Game state and constants
+    const state = {
+      population: 25,
+      power: 0,
+      maxPopulation: 25,
+      day: 1,
+      hour: 10, // Start at 10am
+      dustStorm: false,
+      grid: [],
+      surveyTeam: null,
+      surveyTeamLabel: null,
+      buildTeams: [], // Array of { sprite, targetX, targetY, targetPosX, targetPosY, blueprint, state, label }
+      logisticsTeams: [], // Array of { sprite, targetX, targetY, targetPosX, targetPosY, blueprint, state, label, materials, collectStartTime }
+      blueprints: [], // Array of { x, y, structure, progress, loadingBar }
+      materials: {
+        solarPrefabs: 20,
+        powerLines: 15,
+        metalStruts: 10,
+        lighting: 10,
+        containers: 10,
+        tools: 10,
+        concrete: 10,
+        regolith: 0 // Mined as needed
+      },
+      messages: [], // Array of { text, timestamp }
+      menuVisible: false,
+      menuOptions: ['Solar Array', 'Tunnel Entrance', 'Road', 'Dwelling', 'Wind Turbine', 'Landing Pad'],
+      targetX: null,
+      targetY: null,
+      targetPosX: null,
+      targetPosY: null,
+      path: null,
+      buildMenu: null,
+      contextMenu: null,
+      contextMenuItems: [],
+      bottomMenu: null,
+      bottomMenuItems: [],
+      analysisWindow: null,
+      analysisText: null,
+      messageLogText: null,
+      messageLogScroll: 0,
+      starship: null,
+      menuY: window.innerHeight,
+      menuTargetY: window.innerHeight,
+      menuSpeed: 10,
+      keys: { w: false, a: false, s: false, d: false },
+      statusText: null,
+      positionText: null,
+      uiContainer: null,
+      zoomLevel: 0,
+      zoomScales: [1, 1.5, 2],
+      landingTile: { x: 9, y: 9 } // Landing Pad location (grid[9][9])
+    };
+
+    const config = {
+      gridSize: 20,
+      tileWidth: 96,
+      tileHeight: 48,
+      moveSpeed: 38.4, // Base speed, modified by terrain
+      logisticsSpeed: 76.8, // Double speed for logistics team on flats/desert
+      terrainSpeedModifiers: {
+        'flats': 1.0, // 100% speed
+        'desert': 1.0, // 100% speed (logistics team uses double speed)
+        'hills': 0.6, // 60% speed
+        'crater': 0.4, // 40% speed
+        'mountains': 0.2 // 20% speed
+      },
+      cameraSpeed: 300,
+      buildTime: 30, // Seconds to build a structure
+      regolithCollectTime: 5, // Seconds to collect 4 regolith
+      messageDisplayTime: 10, // Seconds to display a message
+      dayTime: 120, // Seconds per day
+      hourTime: 10, // Seconds per 2-hour increment
+      terrainTypes: [
+        { type: 'flats', color: 0x9A4F3D, text: 'flats', weight: 1, description: 'Smooth, iron-rich regolith plains, ideal for traversal. These flat expanses allow colonists to move quickly and are perfect for building stable structures.' },
+        { type: 'desert', color: 0x8B4513, text: 'desert', weight: 1, description: 'Sandy, wind-swept regolith with loose sediment. Slightly hinders movement due to uneven footing but remains suitable for most construction.' },
+        { type: 'hills', color: 0x6A2E1F, text: 'hills', weight: 1, description: 'Rugged, rocky slopes formed by ancient volcanic activity. Moderately difficult to traverse, requiring careful navigation and impacting build efficiency.' },
+        { type: 'crater', color: 0x5C2F00, text: 'crater', weight: 0.2, description: 'Deep impact craters with steep rims and loose debris. Very challenging to cross, slowing colonists significantly and complicating construction.' },
+        { type: 'mountains', color: 0x4A2C1A, text: 'mountains', weight: 0.2, description: 'Steep, rocky outcrops from ancient tectonic or volcanic processes. Extremely difficult to traverse, severely slowing movement and challenging structural stability.' }
+      ],
+      structures: {
+        'Solar Array': { 
+          type: 'solarArray', 
+          color: 0xFFD700, 
+          text: 'solar', 
+          power: 10, 
+          description: 'A solar panel array harnessing Mars’ sunlight for power. Built on [terrain], it provides 10 power units, doubled during dust storms.',
+          materials: { solarPrefabs: 2, metalStruts: 2, lighting: 1, tools: 1, concrete: 2, powerLines: 1 }
+        },
+        'Tunnel Entrance': { 
+          type: 'tunnelEntrance', 
+          color: 0x4682B4, 
+          text: 'tunnel', 
+          description: 'An entry to subsurface habitats or resource mines. Constructed on [terrain], it facilitates access to underground networks.',
+          materials: {}
+        },
+        'Road': { 
+          type: 'road', 
+          color: 0x696969, 
+          text: 'road', 
+          description: 'A reinforced path for efficient colonist movement. Built on [terrain], it improves traversal speed and logistics.',
+          materials: { concrete: 1, regolith: 6 }
+        },
+        'Landing Pad': { 
+          type: 'landingPad', 
+          color: 0x808080, 
+          text: 'landing pad', 
+          maxPopulation: 25, 
+          description: 'A reinforced pad for spacecraft landings, serving as a central hub for 25 colonists. Located on [terrain], it supports the Starship.',
+          materials: { concrete: 2, powerLines: 1, lighting: 4, regolith: 10 }
+        },
+        'Dwelling': { 
+          type: 'dwelling', 
+          color: 0x228B22, 
+          text: 'dwelling', 
+          maxPopulation: 5, 
+          description: 'A habitat module housing up to 5 colonists. Built on [terrain], it expands living space for the growing colony.',
+          materials: { concrete: 2, regolith: 8, powerLines: 1, lighting: 1 }
+        },
+        'Wind Turbine': { 
+          type: 'windTurbine', 
+          color: 0xA9A9A9, 
+          text: 'wind', 
+          power: 5, 
+          description: 'A turbine generating 5 power units, doubled during dust storms. Constructed on [terrain], it’s vital for energy needs.',
+          materials: {}
+        }
+      }
+    };
+
+    const textStyle = { fontFamily: 'Orbitron, Arial', fontSize: 18, fontWeight: '400', fill: 0xFFFFFF, align: 'left', stroke: '#000000', strokeThickness: 4 };
+    const menuTextStyle = { fontFamily: 'Orbitron, Arial', fontSize: 17, fontWeight: '400', fill: 0xFFFFFF, align: 'left' };
+    const tileTextStyle = { fontFamily: 'Orbitron, Arial', fontSize: 12, fontWeight: '400', fill: 0xFFFFFF, align: 'center', stroke: '#000000', strokeThickness: 2 };
+    const analysisTextStyle = { fontFamily: 'Orbitron, Arial', fontSize: 14, fontWeight: '400', fill: 0xFFFFFF, align: 'left', stroke: '#000000', strokeThickness: 2, wordWrap: true, wordWrapWidth: 200 };
+    const teamLabelStyle = { fontFamily: 'Orbitron, Arial', fontSize: 12, fontWeight: '400', fill: 0xFFFFFF, align: 'center', stroke: '#000000', strokeThickness: 2 };
+
+    // Calculate context menu height
+    const contextOptions = ['Build', 'Analyse', 'Close'];
+    const contextMenuHeight = contextOptions.length * 20 + 20; // 3 options at 20px + padding (~80px)
+
+    // Calculate build menu height
+    const buildMenuHeight = state.menuOptions.length * 20 + 20; // 6 options at 20px + padding (~140px)
+
+    // Create UI container and status/position text
+    state.uiContainer = new PIXI.Container();
+    state.uiContainer.zIndex = 1000;
+    app.stage.addChild(state.uiContainer);
+
+    state.statusText = new PIXI.Text('Day: 1 Hour: 10am\nPower: 0\nColonists: 25\nSurvey Teams: 1\nBuild Teams: 0\nLogistics Teams: 0\nOn Mission: 5\nWeather: Clear\nMaterials:\n  Solar Prefabs: 20\n  Power Lines: 15\n  Metal Struts: 10\n  Lighting: 10\n  Containers: 10\n  Tools: 10\n  Concrete: 10\n  Regolith: 0', { ...textStyle, align: 'left' });
+    state.statusText.x = 20;
+    state.statusText.y = 20;
+    state.uiContainer.addChild(state.statusText);
+
+    state.positionText = new PIXI.Text('Survey Team\n(0, 0)', { ...textStyle, align: 'right' });
+    state.positionText.x = window.innerWidth - 20;
+    state.positionText.y = 20;
+    state.positionText.anchor.set(1, 0);
+    state.uiContainer.addChild(state.positionText);
+
+    // Create message log text
+    state.messageLogText = new PIXI.Text('', { ...teamLabelStyle, align: 'left', wordWrap: true, wordWrapWidth: 300 });
+    state.messageLogText.x = 20;
+    state.messageLogText.y = window.innerHeight - 20;
+    state.messageLogText.anchor.set(0, 1);
+    state.messageLogText.interactive = true;
+    state.messageLogText.zIndex = 900;
+    state.uiContainer.addChild(state.messageLogText);
+
+    // Message log hover and scroll handling
+    let isHovering = false;
+    state.messageLogText.on('mouseover', () => {
+      isHovering = true;
+      updateMessageLog();
+    });
+    state.messageLogText.on('mouseout', () => {
+      isHovering = false;
+      updateMessageLog();
+    });
+    state.messageLogText.on('wheel', (e) => {
+      if (isHovering) {
+        state.messageLogScroll += e.deltaY > 0 ? 1 : -1;
+        state.messageLogScroll = Math.max(0, Math.min(state.messageLogScroll, state.messages.length - 1));
+        updateMessageLog();
+      }
+    });
+
+    // Create grid with (9,9) as (0,0) and weighted terrain
+    function createTile(x, y) {
+      const relativeX = x - 9;
+      const relativeY = y - 9;
+      const terrain = x === 9 && y === 9 ? config.structures['Landing Pad'] : getRandomTerrain();
+      const tile = new PIXI.Graphics();
+      tile.beginFill(terrain.color);
+      tile.lineStyle(2, 0x333333);
+      tile.drawPolygon([
+        0, config.tileHeight / 2,
+        config.tileWidth / 2, 0,
+        config.tileWidth, config.tileHeight / 2,
+        config.tileWidth / 2, config.tileHeight
+      ]);
+      const posX = relativeX * config.tileWidth / 2 - relativeY * config.tileWidth / 2;
+      const posY = (relativeX + relativeY) * config.tileHeight / 2;
+      tile.x = posX + window.innerWidth / 2;
+      tile.y = posY + window.innerHeight / 2;
+      tile.interactive = true;
+      tile.on('mouseover', () => {
+        tile.clear();
+        tile.beginFill(terrain.color);
+        tile.lineStyle(2, 0x00FF00);
+        tile.drawPolygon([
+          0, config.tileHeight / 2,
+          config.tileWidth / 2, 0,
+          config.tileWidth, config.tileHeight / 2,
+          config.tileWidth / 2, config.tileHeight
+        ]);
+      });
+      tile.on('mouseout', () => {
+        tile.clear();
+        tile.beginFill(terrain.color);
+        tile.lineStyle(2, 0x333333);
+        tile.drawPolygon([
+          0, config.tileHeight / 2,
+          config.tileWidth / 2, 0,
+          config.tileWidth, config.tileHeight / 2,
+          config.tileWidth / 2, config.tileHeight
+        ]);
+      });
+      tile.on('click', (event) => handleTileClick(event, relativeX, relativeY));
+      tile.on('rightclick', (event) => openContextMenu(event, relativeX, relativeY));
+
+      const text = new PIXI.Text(terrain.text, { ...tileTextStyle });
+      text.x = tile.x + config.tileWidth / 2;
+      text.y = tile.y + config.tileHeight / 2;
+      text.anchor.set(0.5);
+
+      app.stage.addChild(tile);
+      app.stage.addChild(text);
+      return { sprite: tile, text: text, type: terrain.type, terrainType: terrain.type, relativeX, relativeY };
+    }
+
+    // Weighted random terrain selection
+    function getRandomTerrain() {
+      const totalWeight = config.terrainTypes.reduce((sum, t) => sum + (t.weight || 1), 0);
+      let rand = Math.random() * totalWeight;
+      for (let terrain of config.terrainTypes) {
+        rand -= terrain.weight || 1;
+        if (rand <= 0) return terrain;
+      }
+      return config.terrainTypes[0];
+    }
+
+    for (let x = 0; x < config.gridSize; x++) {
+      state.grid[x] = [];
+      for (let y = 0; y < config.gridSize; y++) {
+        state.grid[x][y] = createTile(x, y);
+      }
+    }
+
+    // Create Starship rectangle on Landing Pad
+    state.starship = new PIXI.Graphics();
+    state.starship.beginFill(0x808080);
+    state.starship.lineStyle(2, 0x000000);
+    state.starship.drawRect(-20, -10, 40, 20);
+    state.starship.x = window.innerWidth / 2 + config.tileWidth / 2;
+    state.starship.y = window.innerHeight / 2 + config.tileHeight / 2;
+    app.stage.addChild(state.starship);
+
+    // Adjust stage to center the grid
+    app.stage.x = 0;
+    app.stage.y = 0;
+    app.stage.scale.x = 1;
+    app.stage.scale.y = 1;
+    app.stage.sortableChildren = true;
+
+    // Add survey team starting at (0,0) (grid[9][9])
+    state.surveyTeam = new PIXI.Graphics();
+    state.surveyTeam.beginFill(0xFF0000); // Red fill
+    state.surveyTeam.lineStyle(2, 0x000000);
+    state.surveyTeam.drawCircle(0, 0, 15);
+    state.surveyTeam.x = window.innerWidth / 2 + config.tileWidth / 2;
+    state.surveyTeam.y = window.innerHeight / 2 + config.tileHeight / 2;
+    app.stage.addChild(state.surveyTeam);
+
+    // Add survey team label
+    state.surveyTeamLabel = new PIXI.Text('Survey Team', { ...teamLabelStyle });
+    state.surveyTeamLabel.x = state.surveyTeam.x;
+    state.surveyTeamLabel.y = state.surveyTeam.y + 20;
+    state.surveyTeamLabel.anchor.set(0.5);
+    app.stage.addChild(state.surveyTeamLabel);
+
+    // Find closest desert tile for Regolith collection
+    function findClosestDesertTile(x, y) {
+      let closest = null;
+      let minDistance = Infinity;
+      for (let i = 0; i < config.gridSize; i++) {
+        for (let j = 0; j < config.gridSize; j++) {
+          if (state.grid[i][j].terrainType === 'desert') {
+            const dist = Math.abs(i - x) + Math.abs(j - y);
+            if (dist < minDistance) {
+              minDistance = dist;
+              closest = { x: i, y: j };
+            }
+          }
+        }
+      }
+      return closest;
+    }
+
+    // Get grid position for a given x, y coordinate
+    function getGridPosition(x, y) {
+      const posX = (x - window.innerWidth / 2 - config.tileWidth / 2) / app.stage.scale.x;
+      const posY = (y - window.innerHeight / 2 - config.tileHeight / 2) / app.stage.scale.y;
+      const gridX = Math.round((posX / (config.tileWidth / 2) + posY / (config.tileHeight / 2)) / 2) + 9;
+      const gridY = Math.round((posY / (config.tileHeight / 2) - posX / (config.tileWidth / 2)) / 2) + 9;
+      return { x: gridX, y: gridY };
+    }
+
+    // Get terrain type for a given position
+    function getTerrainType(x, y) {
+      const { x: gridX, y: gridY } = getGridPosition(x, y);
+      if (gridX >= 0 && gridX < config.gridSize && gridY >= 0 && gridY < config.gridSize) {
+        return state.grid[gridX][gridY].terrainType;
+      }
+      return 'flats'; // Default to flats if out of bounds
+    }
+
+    // Get tile description and measure its height
+    function getTileDescription(tile) {
+      let description;
+      if (tile.type === 'blueprint') {
+        const blueprint = state.blueprints.find(b => b.x === tile.relativeX + 9 && b.y === tile.relativeY + 9);
+        if (blueprint) {
+          const structure = config.structures[blueprint.structure];
+          const terrainDesc = config.terrainTypes.find(t => t.type === tile.terrainType)?.description || 'unknown terrain';
+          description = `A blueprint for a ${blueprint.structure} on ${tile.terrainType}. Under construction, to be completed in 30 seconds.`;
+        }
+      } else {
+        const structure = Object.values(config.structures).find(s => s.type === tile.type);
+        if (structure) {
+          description = structure.description.replace('[terrain]', tile.terrainType);
+        } else {
+          const terrain = config.terrainTypes.find(t => t.type === tile.terrainType);
+          description = terrain ? terrain.description : 'Unknown terrain';
+        }
+      }
+      // Measure text height
+      const metrics = PIXI.TextMetrics.measureText(description, new PIXI.TextStyle(analysisTextStyle));
+      const textHeight = metrics.height + 20; // Add padding
+      return { description, height: Math.max(104, textHeight) };
+    }
+
+    // Update power based on structures
+    function updatePower() {
+      let totalPower = 0;
+      state.grid.forEach(row => row.forEach(tile => {
+        const structure = Object.values(config.structures).find(s => s.type === tile.type);
+        if (structure && structure.power) {
+          totalPower += state.dustStorm && structure.type === 'windTurbine' ? structure.power * 2 : structure.power;
+        }
+      }));
+      state.power = totalPower;
+    }
+
+    // Format hour for display
+    function formatHour(hour) {
+      if (hour === 0) return '0am';
+      if (hour === 12) return '0pm';
+      if (hour < 12) return `${hour}am`;
+      return `${hour - 12}pm`;
+    }
+
+    // Update UI function
+    function updateUI() {
+      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 5; // Survey team (5) + build teams (5 each) + logistics teams (5 each)
+      state.statusText.text = `Day: ${state.day} Hour: ${formatHour(state.hour)}\nPower: ${state.power}\nColonists: ${state.population}\nSurvey Teams: 1\nBuild Teams: ${state.buildTeams.length}\nLogistics Teams: ${state.logisticsTeams.length}\nOn Mission: ${onMission}\nWeather: ${state.dustStorm ? 'Dust Storm' : 'Clear'}\nMaterials:\n  Solar Prefabs: ${state.materials.solarPrefabs}\n  Power Lines: ${state.materials.powerLines}\n  Metal Struts: ${state.materials.metalStruts}\n  Lighting: ${state.materials.lighting}\n  Containers: ${state.materials.containers}\n  Tools: ${state.materials.tools}\n  Concrete: ${state.materials.concrete}\n  Regolith: ${state.materials.regolith}`;
+      const { x: gridX, y: gridY } = getGridPosition(state.surveyTeam.x, state.surveyTeam.y);
+      state.positionText.text = `Survey Team\n(${gridX - 9}, ${gridY - 9})`;
+      state.positionText.x = window.innerWidth - 20;
+    }
+
+    // Update message log display
+    function updateMessageLog() {
+      const currentTime = app.ticker.lastTime / 1000;
+      if (isHovering) {
+        // Show all messages, newest on top, with scrolling
+        const visibleMessages = state.messages.slice().reverse().slice(state.messageLogScroll, state.messageLogScroll + 5); // Show up to 5 messages
+        state.messageLogText.text = visibleMessages.map(m => m.text).join('\n');
+      } else {
+        // Show only the most recent message if not expired
+        const recentMessage = state.messages[state.messages.length - 1];
+        if (recentMessage && currentTime - recentMessage.timestamp < config.messageDisplayTime) {
+          state.messageLogText.text = recentMessage.text;
+        } else {
+          state.messageLogText.text = '';
+        }
+      }
+    }
+
+    // Add message to log
+    function addMessage(text) {
+      state.messages.push({ text, timestamp: app.ticker.lastTime / 1000 });
+      updateMessageLog();
+    }
+
+    // Spawn logistics team from Landing Pad
+    function spawnLogisticsTeam(blueprint) {
+      const team = new PIXI.Graphics();
+      team.beginFill(0x00FF00); // Green fill
+      team.lineStyle(2, 0x000000);
+      team.drawCircle(0, 0, 15);
+      team.x = (state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+      team.y = (state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      app.stage.addChild(team);
+
+      // Add logistics team label
+      team.label = new PIXI.Text('Logistics Team', { ...teamLabelStyle });
+      team.label.x = team.x;
+      team.label.y = team.y + 20;
+      team.label.anchor.set(0.5);
+      app.stage.addChild(team.label);
+
+      // Find closest desert tile for Regolith
+      const desertTile = findClosestDesertTile(blueprint.x, blueprint.y);
+      if (!desertTile) {
+        addMessage('No desert tile found for Regolith collection');
+        app.stage.removeChild(team);
+        app.stage.removeChild(team.label);
+        team.destroy();
+        team.label.destroy();
+        return;
+      }
+
+      const targetPosX = (desertTile.x - 9) * config.tileWidth / 2 - (desertTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+      const targetPosY = (desertTile.x - 9 + desertTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      state.logisticsTeams.push({ 
+        sprite: team, 
+        targetX: desertTile.x - 9, 
+        targetY: desertTile.y - 9, 
+        targetPosX, 
+        targetPosY, 
+        blueprint, 
+        state: 'movingToDesert', 
+        label: team.label, 
+        materials: { regolith: 0 } 
+      });
+      addMessage(`Logistics team spawned for ${blueprint.structure} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+    }
+
+    // Spawn build team from Landing Pad
+    function spawnBuildTeam(blueprint) {
+      const team = new PIXI.Graphics();
+      team.beginFill(0x0000FF); // Blue fill
+      team.lineStyle(2, 0x000000);
+      team.drawCircle(0, 0, 15);
+      team.x = (state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+      team.y = (state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      app.stage.addChild(team);
+
+      // Add build team label
+      team.label = new PIXI.Text('Build Team', { ...teamLabelStyle });
+      team.label.x = team.x;
+      team.label.y = team.y + 20;
+      team.label.anchor.set(0.5);
+      app.stage.addChild(team.label);
+
+      const targetPosX = (blueprint.x - 9) * config.tileWidth / 2 - (blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+      const targetPosY = (blueprint.x - 9 + blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+      state.buildTeams.push({ sprite: team, targetX: blueprint.x - 9, targetY: blueprint.y - 9, targetPosX, targetPosY, blueprint, state: 'movingTo', label: team.label });
+      addMessage(`Build team spawned for ${blueprint.structure} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+    }
+
+    // Check if materials are available
+    function hasMaterials(structure) {
+      const materials = config.structures[structure].materials || {};
+      for (let material in materials) {
+        if (material !== 'regolith' && state.materials[material] < materials[material]) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Deduct materials
+    function deductMaterials(structure) {
+      const materials = config.structures[structure].materials || {};
+      for (let material in materials) {
+        if (material !== 'regolith') {
+          state.materials[material] -= materials[material];
+        }
+      }
+    }
+
+    // Place blueprint on tile
+    function placeBlueprint(option, relativeX, relativeY) {
+      const onMission = 5 + state.buildTeams.length * 5 + state.logisticsTeams.length * 5; // Survey team + build teams + logistics teams
+      if (state.population - onMission < 10) { // 5 for build team, 5 for logistics team
+        addMessage(`Not enough colonists available to spawn teams (Need 10, Available: ${state.population - onMission})`);
+        return;
+      }
+
+      const structure = config.structures[option];
+      if (!structure) {
+        addMessage(`Invalid structure: ${option}`);
+        return;
+      }
+
+      if (!hasMaterials(option)) {
+        addMessage(`Insufficient materials for ${option}`);
+        return;
+      }
+
+      const gridX = relativeX + 9;
+      const gridY = relativeY + 9;
+
+      if (gridX < 0 || gridX >= config.gridSize || gridY < 0 || gridY >= config.gridSize) {
+        addMessage(`Invalid grid coordinates: (${gridX}, ${gridY})`);
+        return;
+      }
+
+      const tile = state.grid[gridX][gridY];
+      if (tile.type !== 'flats' && tile.type !== 'desert' && tile.type !== 'hills' && tile.type !== 'crater' && tile.type !== 'mountains') {
+        addMessage(`Cannot place blueprint on non-terrain tile at (${relativeX}, ${relativeY})`);
+        return;
+      }
+
+      tile.type = 'blueprint';
+      tile.sprite.clear();
+      tile.sprite.beginFill(0x0000FF, 0.5); // Blue, semi-transparent
+      tile.sprite.lineStyle(2, 0x333333);
+      tile.sprite.drawPolygon([
+        0, config.tileHeight / 2,
+        config.tileWidth / 2, 0,
+        config.tileWidth, config.tileHeight / 2,
+        config.tileWidth / 2, config.tileHeight
+      ]);
+      tile.text.text = `${structure.text}\nBlueprint`; // Structure name on first line, Blueprint on second
+
+      // Create loading bar
+      const loadingBar = new PIXI.Graphics();
+      loadingBar.x = tile.x;
+      loadingBar.y = tile.y + config.tileHeight / 2 + 10;
+      loadingBar.beginFill(0xFFFFFF);
+      loadingBar.drawRect(0, 0, 0, 5); // Empty bar
+      app.stage.addChild(loadingBar);
+
+      state.blueprints.push({ x: gridX, y: gridY, structure: option, progress: 0, loadingBar });
+      deductMaterials(option);
+      spawnBuildTeam({ x: gridX, y: gridY, structure: option });
+      spawnLogisticsTeam({ x: gridX, y: gridY, structure: option });
+      addMessage(`Placed ${structure.text} blueprint at (${relativeX}, ${relativeY})`);
+    }
+
+    // Complete blueprint construction
+    function completeBuild(blueprint) {
+      const structure = config.structures[blueprint.structure];
+      const tile = state.grid[blueprint.x][blueprint.y];
+      tile.type = structure.type;
+      tile.sprite.clear();
+      tile.sprite.beginFill(structure.color);
+      tile.sprite.lineStyle(2, 0x333333);
+      tile.sprite.drawPolygon([
+        0, config.tileHeight / 2,
+        config.tileWidth / 2, 0,
+        config.tileWidth, config.tileHeight / 2,
+        config.tileWidth / 2, config.tileHeight
+      ]);
+      tile.text.text = `${structure.text}\n${tile.terrainType}`; // Structure name and terrain type
+
+      updatePower();
+      if (structure.maxPopulation) {
+        state.maxPopulation += structure.maxPopulation;
+        if (state.population < state.maxPopulation) {
+          state.population += 1;
+        }
+      }
+
+      addMessage(`Completed ${blueprint.structure} on ${tile.terrainType} at (${blueprint.x - 9}, ${blueprint.y - 9})`);
+      app.stage.removeChild(blueprint.loadingBar);
+      blueprint.loadingBar.destroy();
+      // Defer blueprint removal to game loop
+    }
+
+    // Place building at survey team's position
+    function placeBuilding(option) {
+      const { x: gridX, y: gridY } = getGridPosition(state.surveyTeam.x, state.surveyTeam.y);
+      placeBlueprint(option, gridX - 9, gridY - 9);
+    }
+
+    // Handle tile left click for survey team movement
+    function handleTileClick(event, x, y) {
+      if (state.contextMenu) {
+        closeContextMenu();
+      }
+
+      state.targetX = x;
+      state.targetY = y;
+
+      if (state.path) {
+        app.stage.removeChild(state.path);
+        state.path.destroy();
+        state.path = null;
+      }
+
+      state.targetPosX = (x * config.tileWidth / 2 - y * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+      state.targetPosY = ((x + y) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+
+      state.path = new PIXI.Graphics();
+      state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
+      state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
+      state.path.lineTo(state.targetPosX, state.targetPosY);
+      app.stage.addChild(state.path);
+    }
+
+    // WASD camera controls and bottom menu trigger
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'w' || e.key === 'W') state.keys.w = true;
+      if (e.key === 'a' || e.key === 'A') state.keys.a = true;
+      if (e.key === 's' || e.key === 'S') state.keys.s = true;
+      if (e.key === 'd' || e.key === 'D') state.keys.d = true;
+      if (e.key === 'b' || e.key === 'B') openBottomMenu();
+    });
+
+    document.addEventListener('keyup', (e) => {
+      if (e.key === 'w' || e.key === 'W') state.keys.w = false;
+      if (e.key === 'a' || e.key === 'A') state.keys.a = false;
+      if (e.key === 's' || e.key === 'S') state.keys.s = false;
+      if (e.key === 'd' || e.key === 'D') state.keys.d = false;
+    });
+
+    // Scroll wheel zoom
+    document.addEventListener('wheel', (e) => {
+      const centerX = window.innerWidth / 2;
+      const centerY = window.innerHeight / 2;
+      const oldScale = state.zoomScales[state.zoomLevel];
+      const mouseX = e.clientX;
+      const mouseY = e.clientY;
+
+      if (e.deltaY < 0) { // Scroll up (zoom in)
+        state.zoomLevel = Math.min(state.zoomLevel + 1, state.zoomScales.length - 1);
+      } else if (e.deltaY > 0) { // Scroll down (zoom out)
+        state.zoomLevel = Math.max(state.zoomLevel - 1, 0);
+      }
+
+      const newScale = state.zoomScales[state.zoomLevel];
+      if (newScale !== oldScale) {
+        const worldX = (mouseX - app.stage.x) / oldScale;
+        const worldY = (mouseY - app.stage.y) / oldScale;
+        app.stage.scale.x = newScale;
+        app.stage.scale.y = newScale;
+        app.stage.x = mouseX - worldX * newScale;
+        app.stage.y = mouseY - worldY * newScale;
+
+        if (state.path) {
+          state.path.clear();
+          state.path.lineStyle(2 / newScale, 0xFFFFFF, 1);
+          state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
+          state.path.lineTo(state.targetPosX, state.targetPosY);
+        }
+
+        state.uiContainer.scale.set(1 / newScale);
+      }
+    });
+
+    // Close analysis window
+    function closeAnalysisWindow() {
+      if (state.analysisWindow) {
+        state.uiContainer.removeChild(state.analysisWindow);
+        state.analysisWindow.destroy();
+        state.analysisWindow = null;
+      }
+      if (state.analysisText) {
+        state.uiContainer.removeChild(state.analysisText);
+        state.analysisText.destroy();
+        state.analysisText = null;
+      }
+    }
+
+    // Open context menu on right-click
+    function openContextMenu(event, relativeX, relativeY) {
+      closeContextMenu();
+      closeBuildMenu();
+      closeAnalysisWindow();
+
+      state.menuVisible = true;
+      state.contextMenu = new PIXI.Graphics();
+      state.contextMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
+      state.contextMenu.drawRect(0, 0, 100, contextMenuHeight); // Dynamic height (~80px)
+      const tile = state.grid[relativeX + 9][relativeY + 9];
+      // Convert tile world coordinates to screen coordinates
+      const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
+      const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
+      // Ensure menu stays within screen bounds
+      state.contextMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 100));
+      state.contextMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - contextMenuHeight));
+      state.contextMenu.zIndex = 900;
+      state.uiContainer.addChild(state.contextMenu);
+
+      const contextOptions = ['Build', 'Analyse', 'Close'];
+      state.contextMenuItems = contextOptions.map((option, index) => {
+        const itemText = new PIXI.Text(option, { ...menuTextStyle });
+        itemText.x = state.contextMenu.x + 10;
+        itemText.y = state.contextMenu.y + 10 + index * 20; // Fixed 20px spacing
+        itemText.anchor.set(0, 0);
+        itemText.interactive = true;
+        itemText.buttonMode = true;
+        itemText.zIndex = 900;
+        itemText.on('click', (e) => {
+          e.stopPropagation();
+          if (option === 'Build') {
+            closeContextMenu();
+            openBuildMenu((tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x, (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y, relativeX, relativeY);
+          } else if (option === 'Analyse') {
+            closeContextMenu();
+            const { description, height } = getTileDescription(tile);
+            state.analysisWindow = new PIXI.Graphics();
+            state.analysisWindow.beginFill(0x333333, 1.0); // Dark grey, opaque
+            state.analysisWindow.drawRect(0, 0, 220, height); // Dynamic height
+            const analysisX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
+            const analysisY = (tile.sprite.y + config.tileHeight / 2 + 20 - app.stage.y) / app.stage.scale.y;
+            state.analysisWindow.x = Math.max(0, Math.min(analysisX, window.innerWidth - 220));
+            state.analysisWindow.y = Math.max(0, Math.min(analysisY, window.innerHeight - height));
+            state.analysisWindow.zIndex = 900;
+            state.uiContainer.addChild(state.analysisWindow);
+
+            state.analysisText = new PIXI.Text(description, { ...analysisTextStyle });
+            state.analysisText.x = state.analysisWindow.x + 10;
+            state.analysisText.y = state.analysisWindow.y + 10;
+            state.analysisText.zIndex = 900;
+            state.uiContainer.addChild(state.analysisText);
+          } else if (option === 'Close') {
+            closeContextMenu();
+          }
+        });
+        state.uiContainer.addChild(itemText);
+        return itemText;
+      });
+
+      app.stage.off('click', handleOutsideClick); // Remove any existing to avoid duplicates
+      app.stage.on('click', handleOutsideClick);
+    }
+
+    // Close context menu
+    function closeContextMenu() {
+      if (state.contextMenu) {
+        state.menuVisible = false;
+        state.contextMenuItems.forEach(item => {
+          state.uiContainer.removeChild(item);
+          item.destroy();
+        });
+        state.uiContainer.removeChild(state.contextMenu);
+        state.contextMenu.destroy();
+        state.contextMenu = null;
+        state.contextMenuItems = [];
+        closeAnalysisWindow();
+        app.stage.off('click', handleOutsideClick);
+      }
+    }
+
+    // Handle outside clicks for context, build, and analysis window
+    function handleOutsideClick(e) {
+      const clickPoint = { x: e.data.global.x, y: e.data.global.y };
+      if (state.menuVisible) {
+        if (state.contextMenu && !state.contextMenu.containsPoint(clickPoint)) {
+          closeContextMenu();
+        } else if (state.buildMenu && !state.buildMenu.containsPoint(clickPoint)) {
+          closeBuildMenu();
+        }
+      }
+      if (state.analysisWindow && !state.analysisWindow.containsPoint(clickPoint)) {
+        closeAnalysisWindow();
+      }
+    }
+
+    // Open build menu
+    function openBuildMenu(x, y, relativeX, relativeY) {
+      closeAnalysisWindow();
+      state.menuVisible = true;
+      state.buildMenu = new PIXI.Graphics();
+      state.buildMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
+      state.buildMenu.drawRect(0, 0, 200, buildMenuHeight); // Dynamic height (~140px)
+      // Ensure menu stays within screen bounds
+      state.buildMenu.x = Math.max(0, Math.min(x, window.innerWidth - 200));
+      state.buildMenu.y = Math.max(0, Math.min(y, window.innerHeight - buildMenuHeight));
+      state.buildMenu.zIndex = 900;
+      state.uiContainer.addChild(state.buildMenu);
+
+      state.menuItems = state.menuOptions.map((option, index) => {
+        const itemText = new PIXI.Text(option, { ...menuTextStyle });
+        itemText.x = state.buildMenu.x + 10;
+        itemText.y = state.buildMenu.y + 10 + index * 20; // Fixed 20px spacing
+        itemText.anchor.set(0, 0);
+        itemText.interactive = true;
+        itemText.buttonMode = true;
+        itemText.zIndex = 900;
+        itemText.on('click', (e) => {
+          e.stopPropagation();
+          placeBlueprint(option, relativeX, relativeY);
+          closeBuildMenu();
+        });
+        state.uiContainer.addChild(itemText);
+        return itemText;
+      });
+
+      app.stage.off('click', handleOutsideClick); // Remove any existing to avoid duplicates
+      app.stage.on('click', handleOutsideClick);
+    }
+
+    // Close build menu
+    function closeBuildMenu() {
+      if (state.menuVisible && state.buildMenu) {
+        state.menuVisible = false;
+        state.menuItems.forEach(item => {
+          state.uiContainer.removeChild(item);
+          item.destroy();
+        });
+        state.uiContainer.removeChild(state.buildMenu);
+        state.buildMenu.destroy();
+        state.buildMenu = null;
+        state.menuItems = [];
+        closeAnalysisWindow();
+        app.stage.off('click', handleOutsideClick);
+      }
+    }
+
+    // Open bottom build menu
+    function openBottomMenu() {
+      if (!state.bottomMenu && !state.menuVisible) {
+        state.bottomMenu = new PIXI.Graphics();
+        state.bottomMenu.beginFill(0x333333, 1.0); // Dark grey, opaque
+        const menuHeight = 100;
+        state.bottomMenu.drawRect(0, 0, window.innerWidth, menuHeight);
+        state.bottomMenu.y = window.innerHeight;
+        state.bottomMenu.zIndex = 900;
+        state.uiContainer.addChild(state.bottomMenu);
+
+        state.bottomMenuItems = state.menuOptions.map((option, index) => {
+          const itemText = new PIXI.Text(option, { ...textStyle, fontSize: 16 });
+          itemText.x = (index * (window.innerWidth / state.menuOptions.length)) + (window.innerWidth / (2 * state.menuOptions.length)) - (itemText.width / 2);
+          itemText.y = 10;
+          itemText.anchor.set(0.5, 0);
+          itemText.interactive = true;
+          itemText.buttonMode = true;
+          itemText.zIndex = 900;
+          itemText.on('click', (e) => {
+            e.stopPropagation();
+            placeBuilding(option);
+            closeBottomMenu();
+          });
+          state.bottomMenu.addChild(itemText);
+          return itemText;
+        });
+
+        state.menuTargetY = window.innerHeight - menuHeight;
+        state.menuVisible = true;
+        addMessage('Bottom menu opened');
+      }
+    }
+
+    // Close bottom build menu
+    function closeBottomMenu() {
+      if (state.bottomMenu) {
+        state.menuTargetY = window.innerHeight;
+        state.menuVisible = false;
+        setTimeout(() => {
+          state.bottomMenuItems.forEach(item => {
+            item.destroy();
+            state.bottomMenu.removeChild(item);
+          });
+          state.uiContainer.removeChild(state.bottomMenu);
+          state.bottomMenu.destroy();
+          state.bottomMenu = null;
+          state.bottomMenuItems = [];
+        }, 500);
+      }
+    }
+
+    // Handle window resize
+    function handleResize() {
+      app.renderer.resize(window.innerWidth, window.innerHeight);
+      state.menuY = window.innerHeight;
+      state.menuTargetY = state.bottomMenu ? window.innerHeight - 100 : window.innerHeight;
+      if (state.bottomMenu) {
+        state.bottomMenu.y = state.menuY;
+        state.bottomMenu.clear();
+        state.bottomMenu.beginFill(0x333333, 1.0);
+        state.bottomMenu.drawRect(0, 0, window.innerWidth, 100);
+        state.bottomMenuItems.forEach((item, index) => {
+          item.x = (index * (window.innerWidth / state.menuOptions.length)) + (window.innerWidth / (2 * state.menuOptions.length)) - (item.width / 2);
+        });
+      }
+      state.grid.forEach(row => row.forEach(tile => {
+        const posX = tile.relativeX * config.tileWidth / 2 - tile.relativeY * config.tileWidth / 2;
+        const posY = (tile.relativeX + tile.relativeY) * config.tileHeight / 2;
+        tile.sprite.x = posX + window.innerWidth / 2;
+        tile.sprite.y = posY + window.innerHeight / 2;
+        tile.text.x = tile.sprite.x + config.tileWidth / 2;
+        tile.text.y = tile.sprite.y + config.tileHeight / 2;
+      }));
+      if (state.starship) {
+        state.starship.x = window.innerWidth / 2 + config.tileWidth / 2;
+        state.starship.y = window.innerHeight / 2 + config.tileHeight / 2;
+      }
+      state.buildTeams.forEach(team => {
+        if (team.state === 'movingTo') {
+          team.targetPosX = (team.targetX * config.tileWidth / 2 - team.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+          team.targetPosY = ((team.targetX + team.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        } else if (team.state === 'returning') {
+          team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+          team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        }
+        if (team.label) {
+          team.label.x = team.sprite.x;
+          team.label.y = team.sprite.y + 20;
+        }
+      });
+      state.logisticsTeams.forEach(team => {
+        if (team.state === 'movingToDesert') {
+          team.targetPosX = (team.targetX * config.tileWidth / 2 - team.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+          team.targetPosY = ((team.targetX + team.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        } else if (team.state === 'movingToBlueprint') {
+          team.targetPosX = (team.blueprint.x - 9) * config.tileWidth / 2 - (team.blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+          team.targetPosY = ((team.blueprint.x - 9 + team.blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        } else if (team.state === 'returning') {
+          team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+          team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        }
+        if (team.label) {
+          team.label.x = team.sprite.x;
+          team.label.y = team.sprite.y + 20;
+        }
+      });
+      state.blueprints.forEach(blueprint => {
+        blueprint.loadingBar.x = (blueprint.x - 9) * config.tileWidth / 2 - (blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2;
+        blueprint.loadingBar.y = ((blueprint.x - 9 + blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2) + 10;
+      });
+      if (state.targetPosX !== null && state.targetPosY !== null) {
+        state.targetPosX = (state.targetX * config.tileWidth / 2 - state.targetY * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+        state.targetPosY = ((state.targetX + state.targetY) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+        if (state.path) {
+          state.path.clear();
+          state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
+          state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
+          state.path.lineTo(state.targetPosX, state.targetPosY);
+        }
+      }
+      state.positionText.x = window.innerWidth - 20;
+      state.messageLogText.y = window.innerHeight - 20;
+      if (state.surveyTeamLabel) {
+        state.surveyTeamLabel.x = state.surveyTeam.x;
+        state.surveyTeamLabel.y = state.surveyTeam.y + 20;
+      }
+      if (state.contextMenu) {
+        const tile = state.grid[Math.round((state.contextMenu.x * app.stage.scale.x + app.stage.x - config.tileWidth / 2 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.contextMenu.y * app.stage.scale.y + app.stage.y + 20 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
+        if (tile) {
+          const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
+          const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
+          state.contextMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 100));
+          state.contextMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - contextMenuHeight));
+          state.contextMenuItems.forEach((item, index) => {
+            item.x = state.contextMenu.x + 10;
+            item.y = state.contextMenu.y + 10 + index * 20;
+          });
+        }
+      }
+      if (state.buildMenu) {
+        const tile = state.grid[Math.round((state.buildMenu.x * app.stage.scale.x + app.stage.x - config.tileWidth / 2 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.buildMenu.y * app.stage.scale.y + app.stage.y + 20 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
+        if (tile) {
+          const menuX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
+          const menuY = (tile.sprite.y - 20 - app.stage.y) / app.stage.scale.y;
+          state.buildMenu.x = Math.max(0, Math.min(menuX, window.innerWidth - 200));
+          state.buildMenu.y = Math.max(0, Math.min(menuY, window.innerHeight - buildMenuHeight));
+          state.menuItems.forEach((item, index) => {
+            item.x = state.buildMenu.x + 10;
+            item.y = state.buildMenu.y + 10 + index * 20;
+          });
+        }
+      }
+      if (state.analysisWindow) {
+        const tile = state.grid[Math.round((state.analysisWindow.x * app.stage.scale.x + app.stage.x + 110 - window.innerWidth / 2) / (config.tileWidth / 2) + 9)][Math.round((state.analysisWindow.y * app.stage.scale.y + app.stage.y - 20 - config.tileHeight / 2 - window.innerHeight / 2) / (config.tileHeight / 2) + 9)];
+        if (tile) {
+          const { height } = getTileDescription(tile);
+          const analysisX = (tile.sprite.x + config.tileWidth / 2 + 10 - app.stage.x) / app.stage.scale.x;
+          const analysisY = (tile.sprite.y + config.tileHeight / 2 + 20 - app.stage.y) / app.stage.scale.y;
+          state.analysisWindow.x = Math.max(0, Math.min(analysisX, window.innerWidth - 220));
+          state.analysisWindow.y = Math.max(0, Math.min(analysisY, window.innerHeight - height));
+          state.analysisText.x = state.analysisWindow.x + 10;
+          state.analysisText.y = state.analysisWindow.y + 10;
+        }
+      }
+      state.uiContainer.scale.set(1 / app.stage.scale.x);
+      updateUI();
+      updateMessageLog();
+    }
+
+    window.addEventListener('resize', handleResize);
+
+    // Game loop for survey team, build teams, logistics teams, blueprints, camera, and timers
+    let lastDayUpdate = 0;
+    let lastHourUpdate = 0;
+    let lastDustStormUpdate = 0;
+    app.ticker.add((delta) => {
+      // Survey team movement
+      if (state.targetPosX !== null && state.targetPosY !== null) {
+        const dx = state.targetPosX - state.surveyTeam.x;
+        const dy = state.targetPosY - state.surveyTeam.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance > 5) {
+          const terrainType = getTerrainType(state.surveyTeam.x, state.surveyTeam.y);
+          const speedModifier = config.terrainSpeedModifiers[terrainType] || 1.0;
+          const speed = config.moveSpeed * speedModifier * (delta / 60) * app.stage.scale.x;
+          const moveDistance = Math.min(speed, distance);
+          const moveX = (dx / distance) * moveDistance;
+          const moveY = (dy / distance) * moveDistance;
+
+          state.surveyTeam.x += moveX;
+          state.surveyTeam.y += moveY;
+          state.surveyTeamLabel.x = state.surveyTeam.x;
+          state.surveyTeamLabel.y = state.surveyTeam.y + 20;
+
+          if (state.path) {
+            state.path.clear();
+            state.path.lineStyle(2 / app.stage.scale.x, 0xFFFFFF, 1);
+            state.path.moveTo(state.surveyTeam.x, state.surveyTeam.y);
+            state.path.lineTo(state.targetPosX, state.targetPosY);
+          }
+
+          updateUI();
+        } else {
+          state.surveyTeam.x = state.targetPosX;
+          state.surveyTeam.y = state.targetPosY;
+          state.surveyTeamLabel.x = state.surveyTeam.x;
+          state.surveyTeamLabel.y = state.surveyTeam.y + 20;
+          state.targetPosX = null;
+          state.targetPosY = null;
+          if (state.path) {
+            app.stage.removeChild(state.path);
+            state.path.destroy();
+            state.path = null;
+          }
+          updateUI();
+        }
+      }
+
+      // Build team movement and construction
+      const completedBlueprints = [];
+      const completedBuildTeams = [];
+      state.buildTeams.forEach(team => {
+        if (team.state === 'movingTo' || team.state === 'returning') {
+          const dx = team.targetPosX - team.sprite.x;
+          const dy = team.targetPosY - team.sprite.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+
+          if (distance > 5) {
+            const terrainType = getTerrainType(team.sprite.x, team.sprite.y);
+            const speedModifier = config.terrainSpeedModifiers[terrainType] || 1.0;
+            const speed = config.moveSpeed * speedModifier * (delta / 60) * app.stage.scale.x;
+            const moveDistance = Math.min(speed, distance);
+            const moveX = (dx / distance) * moveDistance;
+            const moveY = (dy / distance) * moveDistance;
+
+            team.sprite.x += moveX;
+            team.sprite.y += moveY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+          } else {
+            team.sprite.x = team.targetPosX;
+            team.sprite.y = team.targetPosY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            if (team.state === 'movingTo') {
+              team.state = 'building';
+              team.buildStartTime = app.ticker.lastTime / 1000; // Start construction timer
+              addMessage(`Build team reached blueprint at (${team.targetX}, ${team.targetY}), starting construction`);
+            } else if (team.state === 'returning') {
+              app.stage.removeChild(team.sprite);
+              app.stage.removeChild(team.label);
+              team.sprite.destroy();
+              team.label.destroy();
+              completedBuildTeams.push(team);
+              if (state.population < state.maxPopulation) {
+                state.population += 5; // Return 5 colonists to pool
+              }
+              addMessage(`Build team returned to Landing Pad and despawned`);
+            }
+          }
+        } else if (team.state === 'building' && team.blueprint && team.blueprint.loadingBar) {
+          const elapsed = app.ticker.lastTime / 1000 - team.buildStartTime;
+          team.blueprint.progress = elapsed / config.buildTime;
+          team.blueprint.loadingBar.clear();
+          team.blueprint.loadingBar.beginFill(0xFFFFFF);
+          team.blueprint.loadingBar.drawRect(0, 0, config.tileWidth * team.blueprint.progress, 5);
+
+          if (elapsed >= config.buildTime) {
+            completeBuild(team.blueprint);
+            completedBlueprints.push(team.blueprint);
+            team.state = 'returning';
+            team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+            team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+            addMessage(`Build team completed construction at (${team.targetX}, ${team.targetY}), returning to Landing Pad`);
+          }
+        }
+      });
+
+      // Logistics team movement and material collection
+      const completedLogisticsTeams = [];
+      state.logisticsTeams.forEach(team => {
+        if (team.state === 'movingToDesert' || team.state === 'movingToBlueprint' || team.state === 'returning') {
+          const dx = team.targetPosX - team.sprite.x;
+          const dy = team.targetPosY - team.sprite.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+
+          if (distance > 5) {
+            const terrainType = getTerrainType(team.sprite.x, team.sprite.y);
+            const isFastTerrain = terrainType === 'flats' || terrainType === 'desert';
+            const speed = (isFastTerrain ? config.logisticsSpeed : config.moveSpeed) * (config.terrainSpeedModifiers[terrainType] || 1.0) * (delta / 60) * app.stage.scale.x;
+            const moveDistance = Math.min(speed, distance);
+            const moveX = (dx / distance) * moveDistance;
+            const moveY = (dy / distance) * moveDistance;
+
+            team.sprite.x += moveX;
+            team.sprite.y += moveY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+          } else {
+            team.sprite.x = team.targetPosX;
+            team.sprite.y = team.targetPosY;
+            team.label.x = team.sprite.x;
+            team.label.y = team.sprite.y + 20;
+            if (team.state === 'movingToDesert') {
+              team.state = 'collectingRegolith';
+              team.collectStartTime = app.ticker.lastTime / 1000;
+              addMessage(`Logistics team reached desert at (${team.targetX}, ${team.targetY}), collecting Regolith`);
+            } else if (team.state === 'movingToBlueprint') {
+              team.state = 'delivering';
+              const materialsNeeded = config.structures[team.blueprint.structure].materials.regolith || 0;
+              state.materials.regolith += Math.min(team.materials.regolith, materialsNeeded);
+              team.materials.regolith = 0;
+              addMessage(`Logistics team delivered ${Math.min(team.materials.regolith, materialsNeeded)} Regolith to ${team.blueprint.structure} at (${team.blueprint.x - 9}, ${team.blueprint.y - 9})`);
+              team.state = 'returning';
+              team.targetPosX = ((state.landingTile.x - 9) * config.tileWidth / 2 - (state.landingTile.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2);
+              team.targetPosY = ((state.landingTile.x - 9 + state.landingTile.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2);
+            } else if (team.state === 'returning') {
+              app.stage.removeChild(team.sprite);
+              app.stage.removeChild(team.label);
+              team.sprite.destroy();
+              team.label.destroy();
+              completedLogisticsTeams.push(team);
+              if (state.population < state.maxPopulation) {
+                state.population += 5; // Return 5 colonists to pool
+              }
+              addMessage(`Logistics team returned to Landing Pad and despawned`);
+            }
+          }
+        } else if (team.state === 'collectingRegolith') {
+          const elapsed = app.ticker.lastTime / 1000 - team.collectStartTime;
+          if (elapsed >= config.regolithCollectTime) {
+            team.materials.regolith = 4; // Collect 4 Regolith
+            team.state = 'movingToBlueprint';
+            team.targetPosX = (team.blueprint.x - 9) * config.tileWidth / 2 - (team.blueprint.y - 9) * config.tileWidth / 2 + window.innerWidth / 2 + config.tileWidth / 2;
+            team.targetPosY = (team.blueprint.x - 9 + team.blueprint.y - 9) * config.tileHeight / 2 + window.innerHeight / 2 + config.tileHeight / 2;
+            addMessage(`Logistics team collected 4 Regolith, moving to blueprint at (${team.blueprint.x - 9}, ${team.blueprint.y - 9})`);
+          }
+        }
+      });
+
+      // Remove completed blueprints and teams after iteration
+      state.blueprints = state.blueprints.filter(b => !completedBlueprints.includes(b));
+      state.buildTeams = state.buildTeams.filter(t => !completedBuildTeams.includes(t));
+      state.logisticsTeams = state.logisticsTeams.filter(t => !completedLogisticsTeams.includes(t));
+
+      // Remove expired messages
+      const currentTime = app.ticker.lastTime / 1000;
+      state.messages = state.messages.filter(m => currentTime - m.timestamp < config.messageDisplayTime || isHovering);
+      updateMessageLog();
+
+      const cameraSpeed = config.cameraSpeed * (delta / 60) * app.stage.scale.x;
+      if (state.keys.w) app.stage.y += cameraSpeed;
+      if (state.keys.s) app.stage.y -= cameraSpeed;
+      if (state.keys.a) app.stage.x += cameraSpeed;
+      if (state.keys.d) app.stage.x -= cameraSpeed;
+
+      if (state.bottomMenu && state.menuY !== state.menuTargetY) {
+        if (Math.abs(state.menuY - state.menuTargetY) < state.menuSpeed) {
+          state.menuY = state.menuTargetY;
+        } else {
+          state.menuY += (state.menuTargetY - state.menuY) > 0 ? state.menuSpeed : -state.menuSpeed;
+        }
+        state.bottomMenu.y = state.menuY;
+      }
+
+      state.uiContainer.x = -app.stage.x / app.stage.scale.x;
+      state.uiContainer.y = -app.stage.y / app.stage.scale.y;
+      state.uiContainer.scale.set(1 / app.stage.scale.x);
+
+      // Update day, hour, and dust storm timers
+      lastDayUpdate += delta / 60;
+      lastHourUpdate += delta / 60;
+      lastDustStormUpdate += delta / 60;
+      if (lastHourUpdate >= config.hourTime) {
+        state.hour = (state.hour + 2) % 24;
+        lastHourUpdate = 0;
+      }
+      if (lastDayUpdate >= config.dayTime) {
+        state.day += 1;
+        lastDayUpdate = 0;
+      }
+      if (lastDustStormUpdate >= 30) {
+        state.dustStorm = !state.dustStorm;
+        updatePower();
+        lastDustStormUpdate = 0;
+      }
+
+      updateUI();
+    });
+
+    // Initialize UI
+    updateUI();
+  </script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'961485e529e67717',t:'MTc1Mjg2ODM4My4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9624a48f1c75129d',t:'MTc1MzAzNzQxMS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
